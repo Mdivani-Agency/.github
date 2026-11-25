@@ -5,7 +5,7 @@
 // the review posted anything, and to write the one status comment per PR.
 // Run the tests with `node --test 'pr-policy/*.test.mjs'`.
 
-import { CLAUDE_BOT_LOGIN, normalizeLogin } from './review-plan.mjs';
+import { CLAUDE_BOT_LOGIN, normalizeLogin, reviewReplyResult } from './review-plan.mjs';
 
 /** Hidden marker that identifies the status comment. */
 export const STATUS_MARKER = '<!-- mdivani-claude-review-status -->';
@@ -16,7 +16,8 @@ export const STATUS_AUTHOR = 'github-actions[bot]';
 /** Possible results of one Claude code-review step, as returned by `reviewResult()`. */
 export const RESULTS = Object.freeze({
   posted: 'posted', // Claude posted inline comments, a summary or a review
-  empty: 'empty', // the step ran and posted nothing
+  noIssues: 'no-issues', // the review finished, found nothing and posted nothing (the skill posts no summary)
+  empty: 'empty', // the step ran and posted nothing, and its reply does not say it found nothing
   failed: 'failed', // the step itself failed or timed out
   workflowSkip: 'workflow-skip', // claude-code-action skipped itself: the PR changes the calling workflow
   notReviewable: 'not-reviewable', // the PR was closed or turned into a draft during the run
@@ -29,6 +30,59 @@ function byClaude(item, bot) {
 }
 
 /**
+ * Which review step posted an inline comment, from the prefix the security and
+ * migration prompts require ("Security (<severity>):", "Migration:"). Anything
+ * else is the code review's.
+ */
+export function findingStep(body) {
+  const text = String(body ?? '').replace(/^[\s*_>]+/, '');
+  if (/^security\s*\(/i.test(text)) return 'security';
+  if (/^migration\s*:/i.test(text)) return 'migration';
+  return 'code';
+}
+
+/**
+ * What a claude-code-action transcript (its `execution_file`) says about the
+ * code review: the final reply and its "Review result:" line, and the first
+ * line of the skill's review instructions, which names the level and recipe the
+ * skill ran. Accepts the action's JSON array or JSON lines; never throws.
+ *
+ * @returns {{ reply: string, isError: boolean, replyResult: null | { noIssues: true } | { findings: number },
+ *   recipe: string }}
+ */
+export function transcriptSummary(text) {
+  let messages = [];
+  const raw = String(text ?? '').trim();
+  try {
+    const parsed = JSON.parse(raw);
+    messages = Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    for (const line of raw.split(/\r?\n/)) {
+      try {
+        messages.push(JSON.parse(line));
+      } catch {
+        // not a message line
+      }
+    }
+  }
+  let reply = '';
+  let isError = false;
+  let recipe = '';
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue;
+    if (m.type === 'result') {
+      reply = typeof m.result === 'string' ? m.result : '';
+      isError = Boolean(m.is_error);
+    }
+    if (!recipe && m.type === 'system' && m.subtype === 'task_started' && /code-review/.test(String(m.description ?? ''))) {
+      recipe = String(m.prompt ?? '').split(/\r?\n/).map((l) => l.trim()).find((l) => /effort/i.test(l)) ?? '';
+      recipe = recipe.replace(/`/g, '').slice(0, 200);
+    }
+  }
+  return { reply, isError, replyResult: isError ? null : reviewReplyResult(reply), recipe };
+}
+
+/**
  * What Claude posted on the PR since `since` (ISO timestamp, second precision).
  *
  * @param {object} input
@@ -37,21 +91,27 @@ function byClaude(item, bot) {
  * @param {Array} [input.reviews]        REST "list reviews" items
  * @param {string} since
  * @param {string} [botLogin]
- * @returns {{ posted: boolean, findings: number, replies: number, summaries: number, reviews: number }}
- *   `findings` counts new inline threads. Replies to existing threads are counted apart and
- *   do not make `posted` true: the code review never replies, the thread follow-up does.
+ * @returns {{ posted: boolean, findings: number, byStep: { code: number, security: number, migration: number },
+ *   replies: number, summaries: number, reviews: number }}
+ *   `findings` counts new inline threads, and `byStep` splits them by the step that posted
+ *   them (see `findingStep()`). Replies to existing threads are counted apart and do not
+ *   make `posted` true: the code review never replies, the thread follow-up does.
  */
 export function claudeOutputSince({ issueComments = [], reviewComments = [], reviews = [] }, since, botLogin = CLAUDE_BOT_LOGIN) {
   const bot = normalizeLogin(botLogin);
   const after = (at) => Boolean(at) && (!since || at >= since);
   const inline = reviewComments.filter((c) => byClaude(c, bot) && after(c.created_at));
-  const findings = inline.filter((c) => !c.in_reply_to_id).length;
+  const threads = inline.filter((c) => !c.in_reply_to_id);
+  const findings = threads.length;
+  const byStep = { code: 0, security: 0, migration: 0 };
+  for (const c of threads) byStep[findingStep(c.body)] += 1;
   const replies = inline.length - findings;
   const summaries = issueComments.filter((c) => byClaude(c, bot) && after(c.created_at)).length;
   const reviewCount = reviews.filter((r) => byClaude(r, bot) && after(r.submitted_at)).length;
   return {
     posted: findings + summaries + reviewCount > 0,
     findings,
+    byStep,
     replies,
     summaries,
     reviews: reviewCount,
@@ -68,12 +128,14 @@ export function claudeOutputSince({ issueComments = [], reviewComments = [], rev
  *                                      only when the action skipped itself on workflow validation
  *                                      (or refused a fork, which the plan already skips)
  * @param {boolean} input.posted      `claudeOutputSince(...).posted`
+ * @param {boolean} [input.noIssues]  the review's reply ends with "Review result: no issues found"
  * @param {boolean} [input.reviewable] the PR is still open and not a draft
  */
-export function reviewResult({ outcome, conclusion = '', hasAppToken = true, posted, reviewable = true }) {
+export function reviewResult({ outcome, conclusion = '', hasAppToken = true, posted, noIssues = false, reviewable = true }) {
   if (outcome !== 'success') return RESULTS.failed;
   if (!conclusion && !hasAppToken) return RESULTS.workflowSkip;
   if (posted) return RESULTS.posted;
+  if (noIssues) return RESULTS.noIssues;
   if (!reviewable) return RESULTS.notReviewable;
   return RESULTS.empty;
 }
@@ -93,10 +155,28 @@ export function countResolvedByClaude(openIds, threads, botLogin = CLAUDE_BOT_LO
   return (threads ?? []).filter((t) => before.has(t.id) && t.isResolved && normalizeLogin(t.resolvedBy?.login) === bot).length;
 }
 
-function extraLine(label, outcome) {
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** Status-comment text for the code-review step, from its result and its own inline findings. */
+export function codeReviewText(result, findings = 0, retried = false) {
+  const again = retried ? ', also after one retry' : '';
+  if (result === RESULTS.posted) return findings > 0 ? plural(findings, 'finding') : 'posted a comment, no inline findings';
+  if (result === RESULTS.noIssues) return `no issues${retried ? ' (on the retry)' : ''}`;
+  if (result === RESULTS.empty) return `no output${again}`;
+  if (result === RESULTS.failed) return `failed${again}`;
+  return '';
+}
+
+/**
+ * Status-comment text for the security or migration step: findings, "no issues"
+ * (these reviews post nothing when they find nothing), failed, or null when the
+ * step did not run.
+ */
+export function extraReviewText(outcome, findings = 0) {
   if (!outcome || outcome === 'skipped') return null;
-  const text = outcome === 'success' ? 'ran' : outcome === 'failure' ? 'failed' : outcome;
-  return `| ${label} | ${text} |`;
+  if (outcome === 'success') return findings > 0 ? plural(findings, 'finding') : 'no issues';
+  if (outcome === 'failure') return 'failed';
+  return outcome;
 }
 
 /**
@@ -105,13 +185,12 @@ function extraLine(label, outcome) {
  * @param {object} s
  * @param {'reviewed'|'skipped'|'failed'} s.state
  * @param {string} s.sha            reviewed (head) commit
- * @param {string} [s.reason]       why it was skipped or failed
- * @param {object} [s.plan]         { tier, depth, difficulty, model }
+ * @param {string} [s.reason]       why it was skipped or failed; names the step that failed
+ * @param {object} [s.plan]         { tier, level, difficulty, model, command }
+ * @param {Array}  [s.steps]        [{ name, text }]: each review step's result, in run order
  * @param {number} [s.findings]     new inline findings from all review steps
  * @param {number} [s.resolved]     threads resolved by the follow-up step
- * @param {boolean} [s.retried]     the review was run a second time because the first posted nothing
- * @param {string} [s.security]     outcome of the security review step
- * @param {string} [s.migration]    outcome of the migration review step
+ * @param {boolean} [s.retried]     the code review was run a second time because the first posted nothing
  * @param {string} [s.runUrl]
  */
 export function statusCommentBody({
@@ -119,11 +198,10 @@ export function statusCommentBody({
   sha,
   reason = '',
   plan = {},
+  steps = [],
   findings = 0,
   resolved = 0,
   retried = false,
-  security = '',
-  migration = '',
   runUrl = '',
 }) {
   const at = `\`${shortSha(sha)}\``;
@@ -135,7 +213,7 @@ export function statusCommentBody({
   } else if (findings === 0) {
     lines.push(`**No issues found on ${at}.**`);
   } else {
-    lines.push(`**Reviewed ${at}**: ${findings} new finding${findings === 1 ? '' : 's'}, posted as inline comments.`);
+    lines.push(`**Reviewed ${at}**: ${plural(findings, 'new finding')}, posted as inline comments.`);
   }
   if (state !== 'skipped' && plan.tier) {
     lines.push(
@@ -143,15 +221,14 @@ export function statusCommentBody({
       '| Item | Value |',
       '| --- | --- |',
       `| Commit | ${at} |`,
-      `| Tier and depth | ${plan.tier.toUpperCase()} tier, ${plan.depth} depth (difficulty ${plan.difficulty}) |`,
+      `| Tier and level | ${plan.tier.toUpperCase()} tier, ${plan.level} level (difficulty ${plan.difficulty}) |`,
       `| Model | \`${plan.model}\` |`,
-      `| New findings | ${findings} |`,
-      `| Threads resolved by the follow-up | ${resolved} |`,
     );
-    if (retried) lines.push('| Retried | yes: the first attempt posted nothing |');
-    for (const row of [extraLine('Security review', security), extraLine('Migration review', migration)]) {
-      if (row) lines.push(row);
+    for (const step of steps) {
+      if (step?.text) lines.push(`| ${step.name} | ${step.text} |`);
     }
+    lines.push(`| Threads resolved by the follow-up | ${resolved} |`);
+    if (retried) lines.push('| Retried | yes: the first code-review attempt posted nothing |');
   }
   lines.push(
     '',

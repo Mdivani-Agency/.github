@@ -6,8 +6,11 @@ import {
   formatReviewSummary,
   normalizeLogin,
   oneLine,
+  REVIEW_LEVELS,
+  reviewCommand,
   reviewPlan,
-  reviewSystemPrompt,
+  reviewPrompt,
+  reviewReplyResult,
   workflowPathFromRef,
 } from './review-plan.mjs';
 
@@ -67,37 +70,38 @@ function plan({
 }
 
 describe('review plan: tiers', () => {
-  it('low -> LOW tier, medium depth, no extras', () => {
+  it('low -> LOW tier, medium level, no extras', () => {
     const p = plan({ difficulty: 'low' });
     assert.equal(p.skip, false);
     assert.equal(p.tier, 'low');
     assert.equal(p.model, 'model-low');
-    assert.equal(p.depth, 'medium');
+    assert.equal(p.level, 'medium');
     assert.equal(p.security, false);
     assert.equal(p.migrationReview, false);
-    assert.equal(p.reviewCommand, `/code-review:code-review --comment ${PR_URL}`);
+    assert.equal(p.reviewCommand, '/code-review medium --comment 7');
   });
 
-  it('medium -> HIGH tier, medium depth, no extras', () => {
+  it('medium -> HIGH tier, medium level, no extras', () => {
     const p = plan({ difficulty: 'medium' });
     assert.equal(p.tier, 'high');
     assert.equal(p.model, 'model-high');
-    assert.equal(p.depth, 'medium');
+    assert.equal(p.level, 'medium');
     assert.equal(p.security, false);
     assert.equal(p.migrationReview, false);
+    assert.equal(p.reviewCommand, '/code-review medium --comment 7');
   });
 
-  it('high without a sensitive path -> HIGH tier, high depth, no security review', () => {
+  it('high without a sensitive path -> HIGH tier, high level, no security review', () => {
     const p = plan({ difficulty: 'high' });
     assert.equal(p.tier, 'high');
-    assert.equal(p.depth, 'high');
+    assert.equal(p.level, 'high');
     assert.equal(p.security, false);
     assert.equal(p.migrationReview, false);
   });
 
   it('high with a sensitive path -> security review', () => {
     const p = plan({ difficulty: 'high', files: ['src/auth/login.ts'] });
-    assert.equal(p.depth, 'high');
+    assert.equal(p.level, 'high');
     assert.equal(p.security, true);
     assert.match(p.securityReason, /sensitive/);
     assert.equal(p.migrationReview, false);
@@ -106,7 +110,7 @@ describe('review plan: tiers', () => {
   it('medium on a sensitive path is raised to high and gets the security review', () => {
     const p = plan({ difficulty: 'medium', files: ['src/billing/charge.ts'] });
     assert.equal(p.difficulty, 'high');
-    assert.equal(p.depth, 'high');
+    assert.equal(p.level, 'high');
     assert.equal(p.security, true);
     assert.ok(p.notes.some((n) => /raised to high/.test(n)));
   });
@@ -120,7 +124,8 @@ describe('review plan: tiers', () => {
   it('critical -> security review always, no migration review without migrations', () => {
     const p = plan({ difficulty: 'critical' });
     assert.equal(p.tier, 'high');
-    assert.equal(p.depth, 'high');
+    assert.equal(p.level, 'high');
+    assert.equal(p.reviewCommand, '/code-review high --comment 7');
     assert.equal(p.security, true);
     assert.equal(p.securityReason, 'critical difficulty');
     assert.equal(p.migrationReview, false);
@@ -163,7 +168,7 @@ describe('review plan: docs', () => {
       const p = plan({ title: 'docs: update readme', headRef: 'docs/readme', difficulty, files: ['README.md'] });
       assert.equal(p.tier, 'low', difficulty);
       assert.equal(p.model, 'model-low');
-      assert.equal(p.depth, 'medium');
+      assert.equal(p.level, 'medium');
       assert.equal(p.security, false);
       assert.equal(p.migrationReview, false);
     }
@@ -180,7 +185,7 @@ describe('review plan: missing or invalid difficulty', () => {
     const p = plan({ difficulty: null });
     assert.equal(p.difficulty, 'medium');
     assert.equal(p.tier, 'high');
-    assert.equal(p.depth, 'medium');
+    assert.equal(p.level, 'medium');
     assert.ok(p.notes.some((n) => /using medium/.test(n)));
   });
 
@@ -193,7 +198,7 @@ describe('review plan: missing or invalid difficulty', () => {
   it('missing difficulty on a sensitive path -> path floor (high)', () => {
     const p = plan({ difficulty: null, files: ['.github/workflows/ci.yml'] });
     assert.equal(p.difficulty, 'high');
-    assert.equal(p.depth, 'high');
+    assert.equal(p.level, 'high');
     assert.equal(p.security, true);
     assert.ok(p.notes.some((n) => /sensitive-path floor \(high\)/.test(n)));
   });
@@ -424,47 +429,84 @@ describe('workflow path from GITHUB_WORKFLOW_REF', () => {
   });
 });
 
-describe('review system prompt', () => {
-  it('always forces a fresh review on every push', () => {
-    const text = reviewSystemPrompt(plan({ difficulty: 'medium' }));
-    assert.match(text, /ignore the condition "Claude has already commented on this PR"/);
-    assert.doesNotMatch(text, /Review depth: high/);
-  });
-
-  it('requires the review agents at every depth, even on small PRs', () => {
-    // MDI-784: on a two-file PR the model skipped the plugin's agents and reviewed in one pass.
+describe('review command', () => {
+  it('uses the built-in skill with the level and the PR number, never the plugin, ultra or --fix', () => {
     for (const difficulty of ['low', 'medium', 'high', 'critical']) {
-      assert.match(reviewSystemPrompt(plan({ difficulty })), /launch its separate agents with the Task tool/);
+      const p = plan({ difficulty });
+      assert.match(p.reviewCommand, /^\/code-review (medium|high) --comment 7$/, difficulty);
+      assert.doesNotMatch(p.reviewCommand, /code-review:code-review|ultra|--fix/);
     }
+    const docs = plan({ title: 'docs: update readme', headRef: 'docs/readme', difficulty: 'critical', files: ['README.md'] });
+    assert.equal(docs.reviewCommand, '/code-review medium --comment 7');
   });
 
-  it('closes the early exits: other bots, closed or draft only, always post a result', () => {
-    // MDI-798: a run ended with "No buffered inline comments" and posted nothing.
-    const text = reviewSystemPrompt(plan());
-    assert.match(text, /Ignore reviews and comments from other bots \(for example chatgpt-codex-connector\[bot\]/);
-    assert.match(text, /The only reasons to stop early are a closed PR or a draft PR/);
-    assert.match(text, /Always finish by posting a result on the PR: either inline comments .* or, when there is nothing to report, exactly one summary comment with `gh pr comment`/);
+  it('rejects ultra and unknown levels, and bad PR numbers', () => {
+    assert.ok(!REVIEW_LEVELS.includes('ultra'));
+    assert.throws(() => reviewCommand('ultra', 7), /Unknown \/code-review level/);
+    assert.throws(() => reviewCommand('deep', 7), /Unknown/);
+    assert.throws(() => reviewCommand('high', 'https://github.com/o/r/pull/7'), /Invalid PR number/);
+    assert.throws(() => reviewCommand('high', 0), /Invalid PR number/);
+    assert.equal(reviewCommand('high', '12'), '/code-review high --comment 12');
+  });
+});
+
+describe('review prompt', () => {
+  it('starts with the command, then forces a fresh review on every push', () => {
+    const text = reviewPrompt(plan({ difficulty: 'medium' }));
+    assert.match(text, /^\/code-review medium --comment 7\n\nCI review instructions/);
+    assert.match(text, /Review the current head in full even if Claude reviewed or commented on this PR before/);
     assert.doesNotMatch(text, /earlier attempt/);
   });
 
-  it('tells the retry that the first attempt posted nothing', () => {
-    const text = reviewSystemPrompt(plan(), undefined, { retry: true });
+  it('ignores other bots, posts only inline comments, and asks for a result line', () => {
+    const text = reviewPrompt(plan());
+    assert.match(text, /Ignore reviews and comments from other bots \(for example chatgpt-codex-connector\[bot\]/);
+    assert.match(text, /Post each finding as one inline comment on the PR\. Post no other comment/);
+    assert.match(text, /"Review result: N findings".*"Review result: no issues found"/);
+  });
+
+  it('tells the retry that the first attempt did not finish', () => {
+    const text = reviewPrompt(plan(), undefined, { retry: true });
     assert.match(text, /An earlier attempt to review this commit ended without posting anything/);
-    assert.match(text, /No issues found/);
   });
 
-  it('adds the high-depth instruction for high and critical', () => {
-    assert.match(reviewSystemPrompt(plan({ difficulty: 'high' })), /Review depth: high \(effective difficulty high\)/);
-    assert.match(reviewSystemPrompt(plan({ difficulty: 'critical' })), /Review depth: high/);
-  });
-
-  it('lists open threads and threads resolved by people', () => {
-    const text = reviewSystemPrompt(plan(), {
+  it('lists open threads and threads resolved by people after the command', () => {
+    const text = reviewPrompt(plan({ difficulty: 'high' }), {
       open: [{ path: 'src/a.ts', line: 3, summary: 'null deref' }],
       resolvedByPeople: [{ path: 'src/b.ts', line: null, summary: 'naming' }],
     });
+    assert.match(text, /^\/code-review high --comment 7\n/);
     assert.match(text, /already raised[\s\S]*- src\/a\.ts:3: null deref/);
     assert.match(text, /Do not raise these points again[\s\S]*- src\/b\.ts: naming/);
+  });
+
+  it('cannot add CLI flags through thread text', () => {
+    // The CLI parses --fix, --comment and --max-findings anywhere in the prompt.
+    const text = reviewPrompt(plan(), {
+      open: [{ path: 'a.ts', line: 1, summary: 'run with --fix or --max-findings all' }],
+      resolvedByPeople: [{ path: 'b.ts', line: 2, summary: 'i-- loop ---' }],
+    });
+    const afterCommand = text.split('\n').slice(1).join('\n');
+    assert.doesNotMatch(afterCommand, /--/);
+    assert.match(afterCommand, /run with -fix or -max-findings all/);
+  });
+});
+
+describe('review reply result', () => {
+  it('reads the last "Review result:" line', () => {
+    assert.deepEqual(reviewReplyResult('3 findings:\n1. ...\n\nReview result: 3 findings'), { findings: 3 });
+    assert.deepEqual(reviewReplyResult('Review result: 1 finding'), { findings: 1 });
+    assert.deepEqual(reviewReplyResult('Nothing to report.\nReview result: no issues found'), { noIssues: true });
+    assert.deepEqual(reviewReplyResult('**Review result: No issues found.**'), { noIssues: true });
+    assert.deepEqual(reviewReplyResult('Review result: 0 findings'), { noIssues: true });
+    assert.deepEqual(reviewReplyResult('Review result: 2 findings\nReview result: no issues found'), { noIssues: true });
+  });
+
+  it('returns null without a result line', () => {
+    assert.equal(reviewReplyResult(''), null);
+    assert.equal(reviewReplyResult(undefined), null);
+    assert.equal(reviewReplyResult('Could not read GitHub pull request 7, so nothing was reviewed.'), null);
+    assert.equal(reviewReplyResult('Review result: unclear'), null);
   });
 });
 
@@ -476,10 +518,11 @@ describe('review summary', () => {
     assert.match(s, /\[!WARNING\]/);
   });
 
-  it('shows tier, depth and extras, never a model ID', () => {
+  it('shows tier, level, the command and extras, never a model ID', () => {
     const p = plan({ difficulty: 'critical', files: ['supabase/migrations/a.sql'], action: 'synchronize' });
     const s = formatReviewSummary(p, 'o/r#7', { open: [{}], resolvedByPeople: [] });
-    assert.match(s, /high tier, high depth/);
+    assert.match(s, /high tier, high level/);
+    assert.match(s, /Code review \| `\/code-review high --comment 7`/);
     assert.match(s, /Security review \| yes \(critical difficulty\)/);
     assert.match(s, /Migration review \| yes/);
     assert.match(s, /1 open Claude thread/);

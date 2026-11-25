@@ -4,8 +4,8 @@
 // Reads the pull request from the GitHub API (never from checked-out PR code),
 // recomputes the effective difficulty with the PR policy (the difficulty label
 // may not exist yet, because PR policy runs at the same time), builds the
-// review plan, reads Claude's review threads, and writes step outputs, the
-// system-prompt files for the review steps (first attempt and retry), the IDs
+// review plan, reads Claude's review threads, and writes step outputs (among
+// them the code-review prompts for the first attempt and the retry), the IDs
 // of Claude's open threads for the status step, and the job summary. When the
 // PR changes the calling workflow, it writes the skip to the PR's status
 // comment.
@@ -29,7 +29,7 @@ import {
   classifyThreads,
   formatReviewSummary,
   reviewPlan,
-  reviewSystemPrompt,
+  reviewPrompt,
   workflowPathFromRef,
 } from './review-plan.mjs';
 import { findStatusComment, statusCommentBody } from './review-status.mjs';
@@ -137,17 +137,18 @@ async function main() {
   });
 
   let threads = null;
-  let promptFile = '';
-  let retryPromptFile = '';
+  let prompt = '';
+  let retryPrompt = '';
   let openThreadsFile = '';
   if (!plan.skip) {
     threads = classifyThreads(await fetchThreads(number), env.CLAUDE_BOT_LOGIN || CLAUDE_BOT_LOGIN);
+    // The "do not raise again" list goes into the prompt text after the PR
+    // number: the skill's review agent reads it there, not in an appended
+    // system prompt.
+    prompt = reviewPrompt(plan, threads);
+    retryPrompt = reviewPrompt(plan, threads, { retry: true });
     const dir = join(env.RUNNER_TEMP || '/tmp', 'claude-review');
     mkdirSync(dir, { recursive: true });
-    promptFile = join(dir, 'review-system-prompt.md');
-    writeFileSync(promptFile, reviewSystemPrompt(plan, threads));
-    retryPromptFile = join(dir, 'review-system-prompt-retry.md');
-    writeFileSync(retryPromptFile, reviewSystemPrompt(plan, threads, { retry: true }));
     // The status step counts which of these Claude resolved during the run.
     openThreadsFile = join(dir, 'open-thread-ids.json');
     writeFileSync(openThreadsFile, JSON.stringify(threads.open.map((t) => t.id)));
@@ -169,13 +170,13 @@ async function main() {
     skip: String(plan.skip),
     tier: plan.tier,
     model: plan.model,
-    depth: plan.depth,
+    level: plan.level,
     difficulty: plan.difficulty,
     security: String(plan.security),
     migration_review: String(plan.migrationReview),
     review_command: plan.reviewCommand,
-    review_prompt_file: promptFile,
-    retry_prompt_file: retryPromptFile,
+    review_prompt: prompt,
+    retry_prompt: retryPrompt,
     open_threads_file: openThreadsFile,
     pr_number: number ?? '',
     resolve_threads: String(resolveThreads),
@@ -189,6 +190,7 @@ async function main() {
   const summary = formatReviewSummary(plan, number ? `${REPO}#${number}` : '', threads);
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, summary);
   console.log(summary);
+  if (!plan.skip) console.log(`Code review command: ${plan.reviewCommand}\n\nFull prompt:\n${prompt}`);
   if (plan.warning) annotation('warning', plan.warning);
   else if (plan.skip) annotation('notice', `Claude review skipped: ${plan.skipReason}`);
   return 0;

@@ -8,21 +8,24 @@
 //
 //   node review-status-main.mjs check
 //     After a code-review attempt: did Claude post anything on the PR since the
-//     attempt started? Writes the step output `result` (see RESULTS in
-//     review-status.mjs). Never fails.
+//     attempt started, and if not, does the review's reply (in its transcript)
+//     end with "Review result: no issues found"? Writes the step output
+//     `result` (see RESULTS in review-status.mjs) and logs the level and recipe
+//     the skill reported. Never fails.
 //
 //   node review-status-main.mjs report
-//     At the end of the job: creates or edits the PR's status comment (reviewed,
-//     skipped or failed) and fails the step when the review failed or posted
-//     nothing.
+//     At the end of the job: creates or edits the PR's status comment (each
+//     step's result: findings, no issues, no output or failed) and fails the
+//     step when a review step failed or the code review produced no output.
 //
-// Environment (both): GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_API_URL,
+// Environment (all): GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_API_URL,
 // GITHUB_GRAPHQL_URL, GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, PR_NUMBER, SINCE,
 // CLAUDE_BOT_LOGIN (optional).
-// check: STEP_OUTCOME, STEP_CONCLUSION, STEP_HAS_APP_TOKEN ('true'/'false').
-// report: RESULT, RETRIED, HEAD_SHA, TIER, DEPTH, DIFFICULTY, MODEL,
-// OPEN_THREADS_FILE, SECURITY_OUTCOME, MIGRATION_OUTCOME, GITHUB_SERVER_URL,
-// GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT.
+// check: STEP_OUTCOME, STEP_CONCLUSION, STEP_HAS_APP_TOKEN ('true'/'false'),
+// TRANSCRIPT (the step's execution_file; optional).
+// report: RESULT, RETRIED, HEAD_SHA, TIER, LEVEL, DIFFICULTY, MODEL,
+// REVIEW_COMMAND, OPEN_THREADS_FILE, SECURITY_OUTCOME, MIGRATION_OUTCOME,
+// GITHUB_SERVER_URL, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT.
 
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { annotation, createClient, setOutputs } from './github.mjs';
@@ -30,10 +33,13 @@ import { CLAUDE_BOT_LOGIN, WORKFLOW_CHANGED_STATUS } from './review-plan.mjs';
 import {
   RESULTS,
   claudeOutputSince,
+  codeReviewText,
   countResolvedByClaude,
+  extraReviewText,
   findStatusComment,
   reviewResult,
   statusCommentBody,
+  transcriptSummary,
 } from './review-status.mjs';
 
 const env = process.env;
@@ -107,52 +113,56 @@ async function mark() {
   return 0;
 }
 
+function readTranscript(file) {
+  if (!file || !existsSync(file)) return transcriptSummary('');
+  try {
+    return transcriptSummary(readFileSync(file, 'utf8'));
+  } catch (err) {
+    annotation('warning', `Could not read the code-review transcript: ${err.message}`);
+    return transcriptSummary('');
+  }
+}
+
+function describeReply(t) {
+  if (t.isError) return 'the review ended with an error';
+  if (!t.replyResult) return t.reply ? 'the reply has no "Review result:" line' : 'no reply';
+  return t.replyResult.noIssues ? 'the reply says no issues found' : `the reply says ${t.replyResult.findings} finding(s)`;
+}
+
 async function check() {
   const [output, pull] = await Promise.all([claudeOutput(), gh(`/repos/${REPO}/pulls/${NUMBER}`).then((r) => r.json())]);
+  const transcript = readTranscript(env.TRANSCRIPT);
   const result = reviewResult({
     outcome: env.STEP_OUTCOME,
     conclusion: env.STEP_CONCLUSION ?? '',
     hasAppToken: env.STEP_HAS_APP_TOKEN === 'true',
     posted: output.posted,
+    noIssues: Boolean(transcript.replyResult?.noIssues),
     reviewable: pull.state === 'open' && !pull.draft,
   });
   setOutputs({ result });
   summary(
-    `Claude review attempt: ${result} (since ${SINCE || 'job start'}: ${output.findings} inline finding(s), ${output.replies} thread replies, ${output.summaries} PR comment(s), ${output.reviews} review(s) by ${BOT}).`,
+    [
+      `Claude code review attempt: ${result} (since ${SINCE || 'job start'}: ${output.findings} inline finding(s), ${output.replies} thread replies, ${output.summaries} PR comment(s), ${output.reviews} review(s) by ${BOT}; ${describeReply(transcript)}).`,
+      `Level and recipe the /code-review skill reported: ${transcript.recipe || 'not found in the transcript'}.`,
+    ].join('\n\n'),
   );
   return 0;
 }
 
 async function report() {
   const result = env.RESULT || RESULTS.failed;
+  const retried = env.RETRIED === 'true';
   const sha = env.HEAD_SHA ?? '';
   const short = sha.slice(0, 7);
   const runUrl = `${env.GITHUB_SERVER_URL}/${REPO}/actions/runs/${env.GITHUB_RUN_ID}/attempts/${env.GITHUB_RUN_ATTEMPT}`;
-  const plan = { tier: env.TIER, depth: env.DEPTH, difficulty: env.DIFFICULTY, model: env.MODEL };
+  const plan = { tier: env.TIER, level: env.LEVEL, difficulty: env.DIFFICULTY, model: env.MODEL };
+  const command = (env.REVIEW_COMMAND ?? '').replace(/ \d+$/, '');
 
-  let state = 'reviewed';
-  let reason = '';
-  let fail = false;
-  if (result === RESULTS.workflowSkip) {
-    state = 'skipped';
-    reason = `${WORKFLOW_CHANGED_STATUS}: claude-code-action reported a workflow-validation skip (the calling workflow differs from the default branch).`;
-  } else if (result === RESULTS.notReviewable) {
-    state = 'skipped';
-    reason = 'the PR was closed or turned into a draft during the review.';
-  } else if (result === RESULTS.empty) {
-    state = 'failed';
-    reason = `Claude review ran on \`${short}\` but produced no output${env.RETRIED === 'true' ? ', also after one retry' : ''}; re-run the job.`;
-    fail = true;
-  } else if (result !== RESULTS.posted) {
-    state = 'failed';
-    reason = 'the Claude code-review step failed or timed out; see the job log, then re-run the job.';
-    fail = true;
-  }
-
-  let findings = 0;
+  let output = { findings: 0, byStep: { code: 0, security: 0, migration: 0 } };
   let resolved = 0;
   try {
-    findings = (await claudeOutput()).findings;
+    output = await claudeOutput();
     const file = env.OPEN_THREADS_FILE;
     const openIds = file && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : [];
     if (openIds.length) resolved = countResolvedByClaude(openIds, await fetchThreads(), BOT);
@@ -160,23 +170,50 @@ async function report() {
     annotation('warning', `Could not count Claude's findings and resolved threads: ${err.message}`);
   }
 
+  let state = 'reviewed';
+  const failures = [];
+  let reason = '';
+  if (result === RESULTS.workflowSkip) {
+    state = 'skipped';
+    reason = `${WORKFLOW_CHANGED_STATUS}: claude-code-action reported a workflow-validation skip (the calling workflow differs from the default branch).`;
+  } else if (result === RESULTS.notReviewable) {
+    state = 'skipped';
+    reason = 'the PR was closed or turned into a draft during the review.';
+  } else {
+    if (result === RESULTS.empty) {
+      failures.push(`the code review produced no output${retried ? ', also after one retry' : ''}`);
+    } else if (result !== RESULTS.posted && result !== RESULTS.noIssues) {
+      failures.push('the code-review step failed or timed out');
+    }
+    if (env.SECURITY_OUTCOME === 'failure') failures.push('the security-review step failed');
+    if (env.MIGRATION_OUTCOME === 'failure') failures.push('the migration-review step failed');
+    if (failures.length) {
+      state = 'failed';
+      reason = `${failures.join('; ')}. See the job log, then re-run the job.`;
+    }
+  }
+
+  const steps = [
+    { name: `Code review${command ? ` (\`${command}\`)` : ''}`, text: codeReviewText(result, output.byStep.code, retried) },
+    { name: 'Security review', text: extraReviewText(env.SECURITY_OUTCOME, output.byStep.security) },
+    { name: 'Migration review', text: extraReviewText(env.MIGRATION_OUTCOME, output.byStep.migration) },
+  ];
   const body = statusCommentBody({
     state,
     sha,
     reason,
     plan,
-    findings,
+    steps,
+    findings: output.findings,
     resolved,
-    retried: env.RETRIED === 'true',
-    security: env.SECURITY_OUTCOME,
-    migration: env.MIGRATION_OUTCOME,
+    retried,
     runUrl,
   });
   await upsertComment(NUMBER, body, findStatusComment);
   summary(body.replace(/^<!--.*-->\n/, ''));
 
-  if (fail) {
-    annotation('error', `Claude review ${state} on ${short}: ${reason}`);
+  if (state === 'failed') {
+    annotation('error', `Claude review failed on ${short}: ${reason}`);
     return 1;
   }
   if (state === 'skipped') annotation('notice', `Claude review skipped on ${short}: ${reason}`);

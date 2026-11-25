@@ -139,28 +139,28 @@ The `Claude review` job reviews every PR with [`anthropics/claude-code-action@v1
 
 It runs on `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review`) and as a reusable workflow (`workflow_call`). It runs on every PR, including sub-PRs into feature branches, and **on every push**: a PR that Claude already commented on is reviewed again at the new head. Draft PRs do not start the job (`if: github.event.pull_request.draft != true`); they are reviewed when marked ready.
 
-Advisory does not mean silent. Every run that should review ends in one of three states, shown on the PR in the status comment (below): reviewed (findings, or "No issues found"), skipped with a reason, or failed. A failed review also fails the job.
+Advisory does not mean silent. Every run that should review ends in one of three states, shown on the PR in the status comment (below): reviewed (each step's findings, or "no issues"), skipped with a reason, or failed (naming the step). A failed review also fails the job.
 
 ### Difficulty and the review matrix
 
 The plan step recomputes the effective difficulty with the PR policy module (same rules, same per-repo config, PR read fresh from the API). It does not read the `difficulty:*` label, because PR policy runs at the same time and the label may not exist yet. With no valid `Difficulty:` line, the plan uses the path floor (`high`) if a sensitive path is touched, otherwise `medium`, and says so in the job summary.
 
-| Effective difficulty | Model tier | Review | Extra |
+| Effective difficulty | Model tier | Code review | Extra |
 | --- | --- | --- | --- |
-| `low`, and every `docs` PR | LOW | code review, medium depth | none |
-| `medium` | HIGH | code review, medium depth | none |
-| `high` | HIGH | code review, high depth | `/security-review` if a sensitive path is touched |
-| `critical` | HIGH | code review, high depth | `/security-review` always; a migration review if `supabase/migrations/**` is touched |
+| `low`, and every `docs` PR | LOW | `/code-review medium --comment <PR#>` | none |
+| `medium` | HIGH | `/code-review medium --comment <PR#>` | none |
+| `high` | HIGH | `/code-review high --comment <PR#>` | `/security-review` if a sensitive path is touched |
+| `critical` | HIGH | `/code-review high --comment <PR#>` | `/security-review` always; a migration review if `supabase/migrations/**` is touched |
 
-- **Code review** is the `code-review` plugin from the `claude-code-plugins` marketplace (`https://github.com/anthropics/claude-code.git`), run as `/code-review:code-review --comment <PR URL>`. The plugin has no depth flags (its only flag is `--comment`), so the depth is set with an extra system prompt: at high depth its bug agents may read the code around the diff to confirm an issue. The model tier is the main difference between levels.
+- **Code review** is Claude Code's built-in `/code-review` skill (the same one used locally), run as `/code-review <level> --comment <PR#>`. The level sets the review recipe and the model's effort; the skill picks the recipe for the model it runs on (on Opus 5, `medium` and `high` use the same recipe and differ in effort). It reads the PR with `gh pr diff` and the surrounding code, and `--comment` posts each finding as an inline comment. The workflow never passes `ultra` (the cloud review) or `--fix`, and the plan script refuses any level outside `low`, `medium`, `high`, `xhigh` and `max`. The code-review step can read the PR and the checkout and post inline comments; it has no tool that edits files.
+- The CI instructions and the threads not to raise again (below) follow the PR number in the prompt text. The skill reviews in a forked agent, which reads that text but not an appended system prompt (checked on Claude Code 2.1.332).
 - **Security review** is Claude Code's built-in `/security-review`, run in its own step with the same OAuth token (not the standalone security-review action, which needs an API key). It posts each finding as an inline comment starting with `Security (<severity>):`.
 - **Migration review** is a fixed prompt that checks the changed Supabase migrations for data loss, locking, RLS, `SECURITY DEFINER` functions, ordering and deploy compatibility. Comments start with `Migration:`.
 - All steps of one run use the same tier's model.
-- The plugin chooses its own sub-agent models (Haiku, Sonnet and an Opus bug agent). On the LOW tier the workflow sets `CLAUDE_CODE_SUBAGENT_MODEL` to the LOW model with `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`, so every sub-agent runs on the LOW model. On the HIGH tier the plugin keeps its own mix, with the main session on the HIGH model.
 
 ### Re-review and thread resolution
 
-The code-review plugin normally stops when Claude has already commented on the PR. The workflow tells it to ignore that condition (and not to skip a PR as trivial), so each push gets a fresh review of the current head. It also passes the open Claude threads, so the same issue is not posted twice.
+Each push gets a fresh review of the current head: the prompt says that earlier Claude comments refer to earlier commits and that other bots' reviews are no reason to skip an issue. It also lists the open Claude threads, so the same issue is not posted twice.
 
 On a push (`synchronize`), a step before the review follows up on Claude's own threads:
 
@@ -174,15 +174,16 @@ If this step fails, the review still runs.
 
 The workflow keeps **one status comment per PR**. It is written with the workflow's `GITHUB_TOKEN` (author `github-actions[bot]`, not Claude), found by the hidden marker `<!-- mdivani-claude-review-status -->` and edited on every run. It shows:
 
-- the reviewed commit (short SHA), tier and depth, model, the number of new findings, and the threads the follow-up step resolved;
-- whether the security and migration reviews ran (or failed), and whether the review was retried;
-- "No issues found on `<sha>`" when there were no findings.
+- the reviewed commit (short SHA), tier and level, model, and the threads the follow-up step resolved;
+- one line per review step that ran, with its result: the code review (with its command) as `N findings`, `no issues`, `no output` or `failed`; the security and migration reviews as `N findings`, `no issues` or `failed`. Findings are counted per step from the comment prefix (`Security (`, `Migration:`; anything else is the code review's);
+- whether the code review was retried;
+- "No issues found on `<sha>`" when no step posted a finding.
 
 If the comment does not name the PR's latest commit, the review for that commit is missing: re-run the job.
 
-After the code-review step, the workflow checks that Claude (`claude[bot]`) posted something on the PR since the review started: an inline comment, a PR comment or a review. Replies in existing threads do not count, and the start time comes from GitHub's clock. If nothing was posted, it runs the review **once more** with an extra instruction to post a summary. If that also posts nothing, the status comment says "Claude review ran on `<sha>` but produced no output; re-run the job" and the job fails. A code-review step that errors or times out also fails the job, after the status comment is updated. If the PR was closed or turned into a draft during the run, the status comment says so and the job passes.
+The built-in skill posts nothing when it finds nothing, so the prompt asks it to end its reply with `Review result: N findings` or `Review result: no issues found`. After the code-review step, the workflow checks that Claude (`claude[bot]`) posted something on the PR since the review started (an inline comment, a PR comment or a review; replies in existing threads do not count, and the start time comes from GitHub's clock). If nothing was posted, it reads the step's transcript: a reply that ends with `Review result: no issues found` counts as a result ("no issues"). The check also logs the level and recipe the skill reported (for example `high effort → 4 inline angles …`).
 
-The CI system prompt also closes the plugin's early exits: it ignores reviews and comments from other bots (for example `chatgpt-codex-connector[bot]`), stops early only for a closed or draft PR, and always finishes with inline comments or one summary comment.
+If nothing was posted and the reply does not say "no issues", the workflow runs the review **once more** with a note that the first attempt did not finish. If that also produces no output, the status comment says "the code review produced no output, also after one retry" and the job fails. A review step (code, security or migration) that errors or times out also fails the job, and the status comment names it; the other steps still run and their results are still shown. If the PR was closed or turned into a draft during the run, the status comment says so and the job passes.
 
 ### Transcripts
 
@@ -213,7 +214,7 @@ Comments are posted by the Claude GitHub App (`claude[bot]`), which must be inst
 
 ### Tool versions
 
-Claude Code and Bun are installed once per run, not by each Claude step. Each Claude step gets their paths through `path_to_claude_code_executable` and `path_to_bun_executable`, so the action skips its own installs. The `code-review` plugin is still installed by the code-review step, the only step that uses it.
+Claude Code and Bun are installed once per run, not by each Claude step. Each Claude step gets their paths through `path_to_claude_code_executable` and `path_to_bun_executable`, so the action skips its own installs. No plugin is installed: `/code-review` and `/security-review` are built into Claude Code; the pinned 2.1.332 has the `/code-review` levels.
 
 - The versions are pinned in the job `env` of [`claude-review.yml`](.github/workflows/claude-review.yml): `CLAUDE_CODE_VERSION` and `BUN_VERSION`. A check step fails the job if the installed binaries report other versions.
 - The binaries are cached with `actions/cache`. The key contains the runner OS, the architecture and both versions. On a hit nothing is downloaded. The cache is saved right after the install, so it is kept even when a later review step fails.
