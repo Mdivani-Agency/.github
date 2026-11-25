@@ -4,6 +4,7 @@ Org-wide defaults for Mdivani-Agency repositories:
 
 - [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md): the default PR template for every repo that has no template of its own.
 - [`.github/workflows/pr-policy.yml`](.github/workflows/pr-policy.yml): the **PR policy** check. Its logic is in [`pr-policy/policy.mjs`](pr-policy/policy.mjs) and is unit-tested in [`pr-policy/policy.test.mjs`](pr-policy/policy.test.mjs).
+- [`.github/workflows/claude-review.yml`](.github/workflows/claude-review.yml): the advisory **Claude review**, sized by the PR's effective difficulty. Its plan is in [`pr-policy/review-plan.mjs`](pr-policy/review-plan.mjs) and is unit-tested in [`pr-policy/review-plan.test.mjs`](pr-policy/review-plan.test.mjs). See [Claude review](#claude-review).
 
 ## PR template
 
@@ -131,6 +132,89 @@ jobs:
 - Called this way, the check name is `<caller job> / PR policy` (`policy / PR policy` above), not `PR policy`. Use that name if you make it a required status check in branch protection.
 - The workflow checks out this repo (`ref: main`, or `policy-ref`) to get the script, so the target repo needs no copy of it. In this repo itself it uses the PR's own version of the script, so policy changes test themselves.
 
+## Claude review
+
+The `Claude review` job reviews every PR with [`anthropics/claude-code-action@v1`](https://github.com/anthropics/claude-code-action) and posts its findings as inline comments. How deep it goes depends on the PR's effective difficulty. It is **advisory**: it is not a required check, a missing secret or variable makes it warn and pass, and its findings never block a merge.
+
+It runs on `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review`) and as a reusable workflow (`workflow_call`). It runs on every PR, including sub-PRs into feature branches, and **on every push**: a PR that Claude already commented on is reviewed again at the new head.
+
+### Difficulty and the review matrix
+
+The plan step recomputes the effective difficulty with the PR policy module (same rules, same per-repo config, PR read fresh from the API). It does not read the `difficulty:*` label, because PR policy runs at the same time and the label may not exist yet. With no valid `Difficulty:` line, the plan uses the path floor (`high`) if a sensitive path is touched, otherwise `medium`, and says so in the job summary.
+
+| Effective difficulty | Model tier | Review | Extra |
+| --- | --- | --- | --- |
+| `low`, and every `docs` PR | LOW | code review, medium depth | none |
+| `medium` | HIGH | code review, medium depth | none |
+| `high` | HIGH | code review, high depth | `/security-review` if a sensitive path is touched |
+| `critical` | HIGH | code review, high depth | `/security-review` always; a migration review if `supabase/migrations/**` is touched |
+
+- **Code review** is the `code-review` plugin from the `claude-code-plugins` marketplace (`https://github.com/anthropics/claude-code.git`), run as `/code-review:code-review --comment <PR URL>`. The plugin has no depth flags (its only flag is `--comment`), so the depth is set with an extra system prompt: at high depth its bug agents may read the code around the diff to confirm an issue. The model tier is the main difference between levels.
+- **Security review** is Claude Code's built-in `/security-review`, run in its own step with the same OAuth token (not the standalone security-review action, which needs an API key). It posts each finding as an inline comment starting with `Security (<severity>):`.
+- **Migration review** is a fixed prompt that checks the changed Supabase migrations for data loss, locking, RLS, `SECURITY DEFINER` functions, ordering and deploy compatibility. Comments start with `Migration:`.
+- All steps of one run use the same tier's model.
+- The plugin chooses its own sub-agent models (Haiku, Sonnet and an Opus bug agent). On the LOW tier the workflow sets `CLAUDE_CODE_SUBAGENT_MODEL` to the LOW model with `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`, so every sub-agent runs on the LOW model. On the HIGH tier the plugin keeps its own mix, with the main session on the HIGH model.
+
+### Re-review and thread resolution
+
+The code-review plugin normally stops when Claude has already commented on the PR. The workflow tells it to ignore that condition (and not to skip a PR as trivial), so each push gets a fresh review of the current head. It also passes the open Claude threads, so the same issue is not posted twice.
+
+On a push (`synchronize`), a step before the review follows up on Claude's own threads:
+
+1. The plan step lists the PR's review threads with GraphQL and keeps the ones started by `claude[bot]` (the login the Claude GitHub App posts as) that are still unresolved.
+2. Claude, with no skill and at the review's model tier, reads the code at the new head and the commits since its last review. If a thread's issue is fixed, it replies with one line saying what fixed it and resolves the thread (`resolveReviewThread`). If not, or only partly, it leaves the thread open and may reply with what is still missing. Its only GitHub access is `gh api graphql`.
+3. Threads a person resolved are never touched. Their location and a one-line summary go to the review step with the instruction not to raise those points again.
+
+If this step fails, the review still runs.
+
+### Skips
+
+The job passes without reviewing, and says why in the job summary, for:
+
+- release PRs (head `development` into base `main`, same repo);
+- draft PRs (they are reviewed when marked ready) and closed PRs;
+- PRs from forks (secrets are not available there);
+- runs triggered by a bot (claude-code-action does not run for bot actors);
+- missing configuration (below): a `::warning::` names exactly what to set.
+
+### Configuration
+
+| Name | Kind | Value |
+| --- | --- | --- |
+| `CLAUDE_CODE_OAUTH_TOKEN` | org secret | Claude Code OAuth token |
+| `CLAUDE_REVIEW_MODEL_LOW` | org Actions variable | the LOW-tier model ID from the MDI-784 matrix |
+| `CLAUDE_REVIEW_MODEL_HIGH` | org Actions variable | the HIGH-tier model ID from the MDI-784 matrix |
+
+Comments are posted by the Claude GitHub App (`claude[bot]`), which must be installed on the repo; the action gets its token through GitHub OIDC (`id-token: write`).
+
+### Using the review in a repo
+
+Prefer the reusable workflow below. An org ruleset can also run `Mdivani-Agency/.github` -> `.github/workflows/claude-review.yml` as a required workflow, but that makes it a required check: skips and missing configuration still pass, but a review run that errors would block the merge.
+
+Reusable workflow:
+
+```yaml
+# .github/workflows/claude-review.yml in the target repo
+name: Claude review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+  id-token: write
+jobs:
+  review:
+    uses: Mdivani-Agency/.github/.github/workflows/claude-review.yml@main
+    secrets: inherit           # passes CLAUDE_CODE_OAUTH_TOKEN
+    # with:
+    #   policy-ref: main       # optional: ref of this repo to load the plan script from
+```
+
+- The caller must grant the four permissions above.
+- The workflow checks out this repo (`ref: main`, or `policy-ref`) to get the plan script, then checks out the PR head so Claude can read it. Nothing from the PR is executed. In this repo itself it uses the PR's own version of the script.
+
 ## Development
 
 ```bash
@@ -138,3 +222,5 @@ node --test 'pr-policy/*.test.mjs'
 ```
 
 Node 22, no dependencies. CI runs the tests on every PR and on pushes to `main` ([`.github/workflows/test.yml`](.github/workflows/test.yml)).
+
+Files in [`pr-policy/`](pr-policy): `policy.mjs` (PR policy rules), `review-plan.mjs` (Claude review plan and thread handling), both pure and tested; `github.mjs` (API client shared by the two entry points); `main.mjs` and `review-main.mjs` (workflow entry points).
