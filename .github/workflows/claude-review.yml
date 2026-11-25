@@ -145,6 +145,10 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: https://github.com/anthropics/claude-code.git
           plugins: code-review@claude-code-plugins
+          # Temporary (MDI-784): show the full transcript in the job log to check
+          # whether the plugin starts its sub-agents. Callers are private repos.
+          # Turn off again once checked.
+          show_full_output: true
           prompt: ${{ steps.plan.outputs.review_command }}
           claude_args: |
             --model ${{ steps.plan.outputs.model }}
