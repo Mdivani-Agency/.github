@@ -188,6 +188,17 @@ The job passes without reviewing, and says why in the job summary, for:
 
 Comments are posted by the Claude GitHub App (`claude[bot]`), which must be installed on the repo; the action gets its token through GitHub OIDC (`id-token: write`).
 
+### Tool versions
+
+Claude Code and Bun are installed once per run, not by each Claude step. Each Claude step gets their paths through `path_to_claude_code_executable` and `path_to_bun_executable`, so the action skips its own installs. The `code-review` plugin is still installed by the code-review step, the only step that uses it.
+
+- The versions are pinned in the job `env` of [`claude-review.yml`](.github/workflows/claude-review.yml): `CLAUDE_CODE_VERSION` and `BUN_VERSION`. A check step fails the job if the installed binaries report other versions.
+- The binaries are cached with `actions/cache`. The key contains the runner OS, the architecture and both versions. On a hit nothing is downloaded. The cache is saved right after the install, so it is kept even when a later review step fails.
+- GitHub scopes caches to the repo and branch. The workflow runs only on PRs, so a PR's first run downloads the tools and saves a cache for that PR. Later pushes to the same PR use the cache. A cache that is not used for 7 days is removed.
+- With a custom executable the action no longer starts the session in auto permission mode by default. Each Claude step passes `--permission-mode auto` itself.
+
+**To bump the versions:** read the versions that `anthropics/claude-code-action@v1` installs. Claude Code is `claudeCodeVersion` in [`src/entrypoints/run.ts`](https://github.com/anthropics/claude-code-action/blob/v1/src/entrypoints/run.ts). Bun is `bun-version` in the action's [`action.yml`](https://github.com/anthropics/claude-code-action/blob/v1/action.yml). Set `CLAUDE_CODE_VERSION` and `BUN_VERSION` to those values. The cache key changes with them, so the next run installs the new versions. Keep the versions equal to the action's: an older Claude Code can lack a feature the action relies on.
+
 ### Using the review in a repo
 
 Prefer the reusable workflow below. An org ruleset can also run `Mdivani-Agency/.github` -> `.github/workflows/claude-review.yml` as a required workflow, but that makes it a required check: skips and missing configuration still pass, but a review run that errors would block the merge.
