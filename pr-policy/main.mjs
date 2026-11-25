@@ -8,60 +8,19 @@
 // GITHUB_EVENT_NAME, GITHUB_API_URL, GITHUB_OUTPUT, GITHUB_STEP_SUMMARY.
 
 import { appendFileSync, readFileSync } from 'node:fs';
-import {
-  COMMITS_API_CAP,
-  CONFIG_PATH,
-  FILES_API_CAP,
-  evaluate,
-  formatSummary,
-} from './policy.mjs';
+import { annotation, createClient, setOutputs } from './github.mjs';
+import { COMMITS_API_CAP, FILES_API_CAP, evaluate, formatSummary } from './policy.mjs';
 
 const env = process.env;
-const API = env.GITHUB_API_URL || 'https://api.github.com';
 const REPO = env.GITHUB_REPOSITORY;
+const { gh, paginate, readConfig } = createClient({
+  token: env.GITHUB_TOKEN,
+  api: env.GITHUB_API_URL || undefined,
+  graphqlUrl: env.GITHUB_GRAPHQL_URL || undefined,
+  repo: REPO,
+});
 
 const LABEL_COLORS = { critical: 'b60205', high: 'd93f0b', medium: 'fbca04', low: '0e8a16' };
-
-async function gh(path, { method = 'GET', body, accept = 'application/vnd.github+json', allow = [] } = {}) {
-  const res = await fetch(`${API}${path}`, {
-    method,
-    headers: {
-      authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      accept,
-      'x-github-api-version': '2022-11-28',
-      'user-agent': 'mdivani-pr-policy',
-      ...(body ? { 'content-type': 'application/json' } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok && !allow.includes(res.status)) {
-    const text = await res.text().catch(() => '');
-    const err = new Error(`${method} ${path} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
-    err.status = res.status;
-    throw err;
-  }
-  return res;
-}
-
-async function paginate(path, cap) {
-  const items = [];
-  for (let page = 1; items.length < cap; page += 1) {
-    const sep = path.includes('?') ? '&' : '?';
-    const res = await gh(`${path}${sep}per_page=100&page=${page}`);
-    const batch = await res.json();
-    items.push(...batch);
-    if (batch.length < 100) break;
-  }
-  return items.slice(0, cap);
-}
-
-async function readConfig(baseRef) {
-  const res = await gh(
-    `/repos/${REPO}/contents/${CONFIG_PATH}?ref=${encodeURIComponent(baseRef)}`,
-    { accept: 'application/vnd.github.raw', allow: [404] },
-  );
-  return res.status === 404 ? null : res.text();
-}
 
 async function syncLabel(number, difficulty) {
   const want = difficulty ? `difficulty:${difficulty}` : null;
@@ -85,17 +44,6 @@ async function syncLabel(number, difficulty) {
     allow: [422], // already exists
   });
   await gh(`/repos/${REPO}/issues/${number}/labels`, { method: 'POST', body: { labels: [want] } });
-}
-
-function setOutputs(outputs) {
-  const text = Object.entries(outputs).map(([k, v]) => `${k}=${v}\n`).join('');
-  if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, text);
-}
-
-function annotation(level, message) {
-  // Workflow commands must be single-line; escape per the runner's rules.
-  const escaped = message.replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
-  console.log(`::${level}::${escaped}`);
 }
 
 async function main() {
