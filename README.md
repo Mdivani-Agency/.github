@@ -153,6 +153,7 @@ The plan step recomputes the effective difficulty with the PR policy module (sam
 - **Security review** is Claude Code's built-in `/security-review`, run in its own step with the same OAuth token (not the standalone security-review action, which needs an API key). It posts each finding as an inline comment starting with `Security (<severity>):`.
 - **Migration review** is a fixed prompt that checks the changed Supabase migrations for data loss, locking, RLS, `SECURITY DEFINER` functions, ordering and deploy compatibility. Comments start with `Migration:`.
 - All steps of one run use the same tier's model.
+- The plugin chooses its own sub-agent models (Haiku, Sonnet and an Opus bug agent). On the LOW tier the workflow sets `CLAUDE_CODE_SUBAGENT_MODEL` to the LOW model with `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`, so every sub-agent runs on the LOW model. On the HIGH tier the plugin keeps its own mix, with the main session on the HIGH model.
 
 ### Re-review and thread resolution
 

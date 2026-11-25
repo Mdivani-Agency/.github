@@ -119,6 +119,21 @@ jobs:
             --model ${{ steps.plan.outputs.model }}
             --allowedTools "Bash(gh api graphql:*),Read,Grep,Glob,Bash(git log:*),Bash(git diff:*),Bash(git show:*)"
 
+      # The code-review plugin asks for its own sub-agent models (Haiku, Sonnet and an
+      # Opus bug agent), and a per-call model outranks CLAUDE_CODE_SUBAGENT_MODEL. On
+      # the LOW tier, force every sub-agent onto the LOW model so the tier controls
+      # the actual reviewers. Needs Claude Code 2.1.257 or later. The HIGH tier keeps
+      # the plugin's own mix.
+      - name: Pin LOW-tier sub-agents to the LOW model
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.tier == 'low'
+        env:
+          LOW_MODEL: ${{ steps.plan.outputs.model }}
+        run: |
+          {
+            echo "CLAUDE_CODE_SUBAGENT_MODEL=${LOW_MODEL}"
+            echo "CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1"
+          } >> "$GITHUB_ENV"
+
       # The code-review plugin's command. The extra system prompt makes it review
       # every push (the plugin otherwise stops when Claude already commented),
       # sets the depth, and lists threads not to raise again.
