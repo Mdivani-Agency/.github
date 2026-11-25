@@ -137,7 +137,9 @@ jobs:
 
 The `Claude review` job reviews every PR with [`anthropics/claude-code-action@v1`](https://github.com/anthropics/claude-code-action) and posts its findings as inline comments. How deep it goes depends on the PR's effective difficulty. It is **advisory**: it is not a required check, a missing secret or variable makes it warn and pass, and its findings never block a merge.
 
-It runs on `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review`) and as a reusable workflow (`workflow_call`). It runs on every PR, including sub-PRs into feature branches, and **on every push**: a PR that Claude already commented on is reviewed again at the new head.
+It runs on `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review`) and as a reusable workflow (`workflow_call`). It runs on every PR, including sub-PRs into feature branches, and **on every push**: a PR that Claude already commented on is reviewed again at the new head. Draft PRs do not start the job (`if: github.event.pull_request.draft != true`); they are reviewed when marked ready.
+
+Advisory does not mean silent. Every run that should review ends in one of three states, shown on the PR in the status comment (below): reviewed (findings, or "No issues found"), skipped with a reason, or failed. A failed review also fails the job.
 
 ### Difficulty and the review matrix
 
@@ -168,6 +170,24 @@ On a push (`synchronize`), a step before the review follows up on Claude's own t
 
 If this step fails, the review still runs.
 
+### Status comment and empty runs
+
+The workflow keeps **one status comment per PR**. It is written with the workflow's `GITHUB_TOKEN` (author `github-actions[bot]`, not Claude), found by the hidden marker `<!-- mdivani-claude-review-status -->` and edited on every run. It shows:
+
+- the reviewed commit (short SHA), tier and depth, model, the number of new findings, and the threads the follow-up step resolved;
+- whether the security and migration reviews ran (or failed), and whether the review was retried;
+- "No issues found on `<sha>`" when there were no findings.
+
+If the comment does not name the PR's latest commit, the review for that commit is missing: re-run the job.
+
+After the code-review step, the workflow checks that Claude (`claude[bot]`) posted something on the PR since the review started: an inline comment, a PR comment or a review. Replies in existing threads do not count, and the start time comes from GitHub's clock. If nothing was posted, it runs the review **once more** with an extra instruction to post a summary. If that also posts nothing, the status comment says "Claude review ran on `<sha>` but produced no output; re-run the job" and the job fails. A code-review step that errors or times out also fails the job, after the status comment is updated. If the PR was closed or turned into a draft during the run, the status comment says so and the job passes.
+
+The CI system prompt also closes the plugin's early exits: it ignores reviews and comments from other bots (for example `chatgpt-codex-connector[bot]`), stops early only for a closed or draft PR, and always finishes with inline comments or one summary comment.
+
+### Transcripts
+
+Each Claude step's transcript (`claude-execution-output.json`) is uploaded as the artifact `claude-review-transcripts-<attempt>`, kept for 7 days, so a review that posted nothing can be debugged. Before the upload, a transcript that contains the OAuth token, the workflow token, or a token-shaped string (`sk-ant-…`, `ghp_`/`ghs_`/… , `github_pat_…`) is dropped and the job warns. The transcripts contain the PR's code and Claude's tool output; artifacts have the same access as the repo.
+
 ### Skips
 
 The job passes without reviewing, and says why in the job summary, for:
@@ -176,7 +196,10 @@ The job passes without reviewing, and says why in the job summary, for:
 - draft PRs (they are reviewed when marked ready) and closed PRs;
 - PRs from forks (secrets are not available there);
 - runs triggered by a bot (claude-code-action does not run for bot actors);
-- missing configuration (below): a `::warning::` names exactly what to set.
+- missing configuration (below): a `::warning::` names exactly what to set;
+- PRs that change the calling workflow (the file in `GITHUB_WORKFLOW_REF`; in a target repo, its own `claude-review.yml`). `claude-code-action` refuses to run while that file differs from the default branch. The plan step detects it from the changed files and the workflow also catches the action's own workflow-validation skip. Both write "review skipped: this PR changes the review workflow" to the status comment and pass with a notice. The review works again once the change is merged.
+
+Only the last skip is written to the status comment; drafts never start the job.
 
 ### Configuration
 
@@ -235,4 +258,4 @@ node --test 'pr-policy/*.test.mjs'
 
 Node 22, no dependencies. CI runs the tests on every PR and on pushes to `main` ([`.github/workflows/test.yml`](.github/workflows/test.yml)).
 
-Files in [`pr-policy/`](pr-policy): `policy.mjs` (PR policy rules), `review-plan.mjs` (Claude review plan and thread handling), both pure and tested; `github.mjs` (API client shared by the two entry points); `main.mjs` and `review-main.mjs` (workflow entry points).
+Files in [`pr-policy/`](pr-policy): `policy.mjs` (PR policy rules), `review-plan.mjs` (Claude review plan, prompts and thread handling) and `review-status.mjs` (was anything posted, status comment), all pure and tested; `github.mjs` (API client shared by the entry points); `main.mjs`, `review-main.mjs` and `review-status-main.mjs` (workflow entry points).

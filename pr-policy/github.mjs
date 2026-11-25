@@ -63,7 +63,22 @@ export function createClient({
     return json.data;
   }
 
-  return { gh, paginate, readConfig, graphql };
+  /**
+   * Create or edit one comment on a PR. `find` picks the existing comment from
+   * the PR's issue comments (or returns null to create a new one).
+   */
+  async function upsertComment(number, body, find) {
+    const comments = await paginate(`/repos/${repo}/issues/${number}/comments`, 1000);
+    const existing = find(comments);
+    if (existing) {
+      await gh(`/repos/${repo}/issues/comments/${existing.id}`, { method: 'PATCH', body: { body } });
+      return { id: existing.id, created: false };
+    }
+    const res = await gh(`/repos/${repo}/issues/${number}/comments`, { method: 'POST', body: { body } });
+    return { id: (await res.json()).id, created: true };
+  }
+
+  return { gh, paginate, readConfig, graphql, upsertComment };
 }
 
 /** Write step outputs. Multi-line values use a random heredoc delimiter. */
