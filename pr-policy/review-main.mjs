@@ -4,15 +4,19 @@
 // Reads the pull request from the GitHub API (never from checked-out PR code),
 // recomputes the effective difficulty with the PR policy (the difficulty label
 // may not exist yet, because PR policy runs at the same time), builds the
-// review plan, reads Claude's review threads, and writes step outputs, a
-// system-prompt file for the review steps, and the job summary.
+// review plan, reads Claude's review threads, and writes step outputs, the
+// system-prompt files for the review steps (first attempt and retry), the IDs
+// of Claude's open threads for the status step, and the job summary. When the
+// PR changes the calling workflow, it writes the skip to the PR's status
+// comment.
 //
 // Never fails on misconfiguration: a missing secret or variable is a warning
 // and the plan says skip.
 //
 // Environment: GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_EVENT_PATH,
-// GITHUB_EVENT_NAME, GITHUB_ACTOR, GITHUB_SERVER_URL, GITHUB_API_URL,
-// GITHUB_GRAPHQL_URL, GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, RUNNER_TEMP,
+// GITHUB_EVENT_NAME, GITHUB_ACTOR, GITHUB_WORKFLOW_REF, GITHUB_SERVER_URL,
+// GITHUB_API_URL, GITHUB_GRAPHQL_URL, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT,
+// GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, RUNNER_TEMP,
 // HAS_CLAUDE_TOKEN ('true'/'false'), CLAUDE_REVIEW_MODEL_LOW,
 // CLAUDE_REVIEW_MODEL_HIGH, CLAUDE_BOT_LOGIN (optional).
 
@@ -26,12 +30,14 @@ import {
   formatReviewSummary,
   reviewPlan,
   reviewSystemPrompt,
+  workflowPathFromRef,
 } from './review-plan.mjs';
+import { findStatusComment, statusCommentBody } from './review-status.mjs';
 
 const env = process.env;
 const REPO = env.GITHUB_REPOSITORY;
 const [OWNER, NAME] = (REPO ?? '').split('/');
-const { gh, paginate, readConfig, graphql } = createClient({
+const { gh, paginate, readConfig, graphql, upsertComment } = createClient({
   token: env.GITHUB_TOKEN,
   api: env.GITHUB_API_URL || undefined,
   graphqlUrl: env.GITHUB_GRAPHQL_URL || undefined,
@@ -127,16 +133,35 @@ async function main() {
     policy,
     files,
     config,
+    workflowPath: workflowPathFromRef(env.GITHUB_WORKFLOW_REF, REPO),
   });
 
   let threads = null;
   let promptFile = '';
+  let retryPromptFile = '';
+  let openThreadsFile = '';
   if (!plan.skip) {
     threads = classifyThreads(await fetchThreads(number), env.CLAUDE_BOT_LOGIN || CLAUDE_BOT_LOGIN);
     const dir = join(env.RUNNER_TEMP || '/tmp', 'claude-review');
     mkdirSync(dir, { recursive: true });
     promptFile = join(dir, 'review-system-prompt.md');
     writeFileSync(promptFile, reviewSystemPrompt(plan, threads));
+    retryPromptFile = join(dir, 'review-system-prompt-retry.md');
+    writeFileSync(retryPromptFile, reviewSystemPrompt(plan, threads, { retry: true }));
+    // The status step counts which of these Claude resolved during the run.
+    openThreadsFile = join(dir, 'open-thread-ids.json');
+    writeFileSync(openThreadsFile, JSON.stringify(threads.open.map((t) => t.id)));
+  }
+
+  // A skip the PR should see (the PR changes the review workflow) goes to the status comment.
+  if (plan.skip && plan.statusComment && pull) {
+    const runUrl = `${env.GITHUB_SERVER_URL}/${REPO}/actions/runs/${env.GITHUB_RUN_ID}/attempts/${env.GITHUB_RUN_ATTEMPT}`;
+    const body = statusCommentBody({ state: 'skipped', sha: pull.head.sha, reason: plan.statusComment, runUrl });
+    try {
+      await upsertComment(number, body, findStatusComment);
+    } catch (err) {
+      annotation('warning', `Could not update the Claude review status comment: ${err.message}`);
+    }
   }
 
   const resolveThreads = Boolean(plan.resolveThreads && threads?.open.length);
@@ -150,6 +175,9 @@ async function main() {
     migration_review: String(plan.migrationReview),
     review_command: plan.reviewCommand,
     review_prompt_file: promptFile,
+    retry_prompt_file: retryPromptFile,
+    open_threads_file: openThreadsFile,
+    pr_number: number ?? '',
     resolve_threads: String(resolveThreads),
     open_threads: resolveThreads ? JSON.stringify(threads.open, null, 2) : '',
     last_reviewed_sha: threads?.lastReviewedSha ?? '',

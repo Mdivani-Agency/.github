@@ -8,6 +8,7 @@ import {
   oneLine,
   reviewPlan,
   reviewSystemPrompt,
+  workflowPathFromRef,
 } from './review-plan.mjs';
 
 const PR_URL = 'https://github.com/Mdivani-Agency/app/pull/7';
@@ -37,6 +38,7 @@ function plan({
   eventName = 'pull_request',
   actor = 'dev',
   config = CONFIGURED,
+  workflowPath = '.github/workflows/claude-review.yml',
 } = {}) {
   const fileItems = files.map((filename) => ({ filename }));
   const policy = evaluate({
@@ -60,6 +62,7 @@ function plan({
     policy,
     files: fileItems,
     config,
+    workflowPath,
   });
 }
 
@@ -248,6 +251,41 @@ describe('review plan: skips', () => {
     assert.match(p.skipReason, /bot/);
   });
 
+  it('skips a PR that changes the calling workflow, with a status comment', () => {
+    // MDI-798: claude-code-action refuses to run when the caller workflow differs from the default branch.
+    const p = plan({ files: ['src/a.ts', '.github/workflows/claude-review.yml'] });
+    assert.equal(p.skip, true);
+    assert.match(p.skipReason, /this PR changes the review workflow \(\.github\/workflows\/claude-review\.yml\)/);
+    assert.match(p.statusComment, /^review skipped: this PR changes the review workflow/);
+    assert.equal(p.warning, '');
+  });
+
+  it('detects a renamed caller workflow and a caller with another name', () => {
+    const renamed = reviewPlan({
+      eventName: 'pull_request',
+      action: 'synchronize',
+      pr: { number: 7, url: PR_URL, state: 'open', draft: false, headRepo: 'o/r', baseRepo: 'o/r' },
+      policy: { outputs: { type: 'feature', difficulty: 'medium', sensitive: 'false', is_release: 'false' }, declaredDifficulty: 'medium' },
+      files: [{ filename: '.github/workflows/review.yml', previous_filename: '.github/workflows/ai.yml' }],
+      config: CONFIGURED,
+      workflowPath: '.github/workflows/ai.yml',
+    });
+    assert.equal(renamed.skip, true);
+    assert.equal(plan({ files: ['.github/workflows/ci.yml'] }).skip, false);
+    assert.equal(plan({ files: ['.github/workflows/claude-review.yml'], workflowPath: '' }).skip, false);
+  });
+
+  it('reports a missing configuration before a workflow change', () => {
+    const p = plan({ files: ['.github/workflows/claude-review.yml'], config: { ...CONFIGURED, hasToken: false } });
+    assert.match(p.skipReason, /not configured/);
+    assert.equal(p.statusComment, '');
+  });
+
+  it('other skips and reviews carry no status comment', () => {
+    assert.equal(plan({ draft: true }).statusComment, '');
+    assert.equal(plan().statusComment, '');
+  });
+
   it('reviews every push, even when Claude already commented', () => {
     const p = plan({ action: 'synchronize' });
     assert.equal(p.skip, false);
@@ -371,6 +409,21 @@ describe('review threads', () => {
   });
 });
 
+describe('workflow path from GITHUB_WORKFLOW_REF', () => {
+  it('strips the repository and the ref', () => {
+    assert.equal(
+      workflowPathFromRef('Mdivani-Agency/talvio-web-app/.github/workflows/claude-review.yml@refs/pull/314/merge', 'Mdivani-Agency/talvio-web-app'),
+      '.github/workflows/claude-review.yml',
+    );
+    assert.equal(workflowPathFromRef('o/r/.github/workflows/x.yml@refs/heads/main'), '.github/workflows/x.yml');
+  });
+
+  it('returns an empty path for a missing ref', () => {
+    assert.equal(workflowPathFromRef(undefined), '');
+    assert.equal(workflowPathFromRef(''), '');
+  });
+});
+
 describe('review system prompt', () => {
   it('always forces a fresh review on every push', () => {
     const text = reviewSystemPrompt(plan({ difficulty: 'medium' }));
@@ -383,6 +436,21 @@ describe('review system prompt', () => {
     for (const difficulty of ['low', 'medium', 'high', 'critical']) {
       assert.match(reviewSystemPrompt(plan({ difficulty })), /launch its separate agents with the Task tool/);
     }
+  });
+
+  it('closes the early exits: other bots, closed or draft only, always post a result', () => {
+    // MDI-798: a run ended with "No buffered inline comments" and posted nothing.
+    const text = reviewSystemPrompt(plan());
+    assert.match(text, /Ignore reviews and comments from other bots \(for example chatgpt-codex-connector\[bot\]/);
+    assert.match(text, /The only reasons to stop early are a closed PR or a draft PR/);
+    assert.match(text, /Always finish by posting a result on the PR: either inline comments .* or, when there is nothing to report, exactly one summary comment with `gh pr comment`/);
+    assert.doesNotMatch(text, /earlier attempt/);
+  });
+
+  it('tells the retry that the first attempt posted nothing', () => {
+    const text = reviewSystemPrompt(plan(), undefined, { retry: true });
+    assert.match(text, /An earlier attempt to review this commit ended without posting anything/);
+    assert.match(text, /No issues found/);
   });
 
   it('adds the high-depth instruction for high and critical', () => {
