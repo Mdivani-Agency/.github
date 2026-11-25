@@ -145,15 +145,11 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: https://github.com/anthropics/claude-code.git
           plugins: code-review@claude-code-plugins
-          # Temporary (MDI-784): show the full transcript in the job log to check
-          # whether the plugin starts its sub-agents. Callers are private repos.
-          # Turn off again once checked.
-          show_full_output: true
           prompt: ${{ steps.plan.outputs.review_command }}
           claude_args: |
             --model ${{ steps.plan.outputs.model }}
             --append-system-prompt-file ${{ steps.plan.outputs.review_prompt_file }}
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*),Read,Grep,Glob"
+            --allowedTools "Task,mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*),Read,Grep,Glob"
 
       # The built-in /security-review diffs against origin/HEAD, which
       # actions/checkout does not set.
