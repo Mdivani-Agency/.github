@@ -236,14 +236,19 @@ export function parseBody(body) {
   const lines = stripHtmlComments(body ?? '').split(/\r?\n/);
   const sections = new Map();
   const difficulties = [];
-  let current = null;
+  // Open sections, outermost first. A heading closes every open section of
+  // the same or a deeper level, so text under `### Bug fix` inside
+  // `## Changes` still counts toward Changes.
+  const open = [];
   for (const line of lines) {
     const heading = HEADING_RE.exec(line);
     if (heading) {
       const level = heading[1].length;
       const name = heading[2].trim().toLowerCase();
-      current = sections.has(name) ? { level, lines: [] } : { level, lines: [], name };
-      if (current.name) sections.set(name, current);
+      while (open.length > 0 && open[open.length - 1].level >= level) open.pop();
+      const section = { level, lines: [] };
+      if (!sections.has(name)) sections.set(name, section);
+      open.push(section);
       continue;
     }
     const diff = DIFFICULTY_LINE_RE.exec(line);
@@ -251,7 +256,7 @@ export function parseBody(body) {
       difficulties.push(diff[1]);
       continue;
     }
-    if (current) current.lines.push(line);
+    for (const section of open) section.lines.push(line);
   }
   const contents = new Map();
   for (const [name, s] of sections) contents.set(name, s.lines.join('\n').trim());

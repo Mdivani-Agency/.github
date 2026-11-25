@@ -183,6 +183,22 @@ describe('parseBody', () => {
     assert.equal(sections.get('affected areas'), '');
   });
 
+  it('counts subsection content toward the parent section', () => {
+    const { sections } = parseBody(
+      '## Changes\n### Bug fix\nFix the redirect.\n\n## Affected areas\n### Pages\n- /auth\n## Difficulty\nDifficulty: low\n',
+    );
+    assert.match(sections.get('changes'), /Fix the redirect\./);
+    assert.doesNotMatch(sections.get('changes'), /\/auth/);
+    assert.equal(sections.get('affected areas'), '- /auth');
+    assert.equal(sections.get('bug fix'), 'Fix the redirect.');
+  });
+
+  it('closes a section at a heading of the same or higher level', () => {
+    const { sections } = parseBody('### Changes\nA\n## Affected areas\nB\n');
+    assert.equal(sections.get('changes'), 'A');
+    assert.equal(sections.get('affected areas'), 'B');
+  });
+
   it('ignores a Difficulty line inside a comment', () => {
     assert.deepEqual(parseBody('<!-- Difficulty: low -->').difficulties, []);
   });
