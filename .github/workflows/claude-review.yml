@@ -163,6 +163,12 @@ jobs:
         env:
           CACHE_HIT: ${{ steps.tools-cache.outputs.cache-hit }}
 
+      # Checking out the PR head into the workspace deletes .pr-policy, so the
+      # status steps after it run the scripts from a copy in RUNNER_TEMP.
+      - name: Keep the review scripts outside the workspace
+        if: steps.plan.outputs.skip == 'false'
+        run: cp -R .pr-policy/pr-policy "$RUNNER_TEMP/claude-review-scripts"
+
       # Claude reads the code at the PR head; nothing here runs it. Full history
       # so the reviews can diff against the base branch and the last review.
       - name: Check out PR head
@@ -250,7 +256,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
-        run: node .pr-policy/pr-policy/review-status-main.mjs mark
+        run: node "$RUNNER_TEMP/claude-review-scripts/review-status-main.mjs" mark
 
       # The code-review plugin's command. The extra system prompt makes it review
       # every push (the plugin otherwise stops when Claude already commented),
@@ -295,7 +301,7 @@ jobs:
           STEP_OUTCOME: ${{ steps.review.outcome }}
           STEP_CONCLUSION: ${{ steps.review.outputs.conclusion }}
           STEP_HAS_APP_TOKEN: ${{ steps.review.outputs.github_token != '' }}
-        run: node .pr-policy/pr-policy/review-status-main.mjs check
+        run: node "$RUNNER_TEMP/claude-review-scripts/review-status-main.mjs" check
 
       # One retry when the review posted nothing, with an explicit instruction to
       # post a summary. Same command, tier and tools as the first attempt.
@@ -307,11 +313,14 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          path_to_claude_code_executable: ${{ steps.tools.outputs.claude }}
+          path_to_bun_executable: ${{ steps.tools.outputs.bun }}
           plugin_marketplaces: https://github.com/anthropics/claude-code.git
           plugins: code-review@claude-code-plugins
           prompt: ${{ steps.plan.outputs.review_command }}
           claude_args: |
             --model ${{ steps.plan.outputs.model }}
+            --permission-mode auto
             --append-system-prompt-file ${{ steps.plan.outputs.retry_prompt_file }}
             --allowedTools "Task,mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*),Read,Grep,Glob"
 
@@ -333,7 +342,7 @@ jobs:
           STEP_OUTCOME: ${{ steps.retry.outcome }}
           STEP_CONCLUSION: ${{ steps.retry.outputs.conclusion }}
           STEP_HAS_APP_TOKEN: ${{ steps.retry.outputs.github_token != '' }}
-        run: node .pr-policy/pr-policy/review-status-main.mjs check
+        run: node "$RUNNER_TEMP/claude-review-scripts/review-status-main.mjs" check
 
       # The built-in /security-review diffs against origin/HEAD, which
       # actions/checkout does not set.
@@ -416,7 +425,7 @@ jobs:
           OPEN_THREADS_FILE: ${{ steps.plan.outputs.open_threads_file }}
           SECURITY_OUTCOME: ${{ steps.security.outcome }}
           MIGRATION_OUTCOME: ${{ steps.migration.outcome }}
-        run: node .pr-policy/pr-policy/review-status-main.mjs report
+        run: node "$RUNNER_TEMP/claude-review-scripts/review-status-main.mjs" report
 
       # Transcripts of the Claude steps, for debugging a review that posted
       # nothing. Kept 7 days. A transcript that contains one of the job's tokens
