@@ -10,10 +10,14 @@
 # yet, because PR policy runs at the same time). Claude then reads the PR head
 # to review it; PR code is never executed by this workflow.
 #
+# The code review is Claude Code's built-in /code-review skill, run as
+# `/code-review <level> --comment <PR#>` (medium or high; never ultra, never --fix).
+#
 # Advisory only: a missing secret or variable is a warning and the job passes.
 # A run that should review never ends silently: the workflow keeps one status
-# comment per PR (reviewed, skipped and why, or failed), retries a review that
-# posted nothing once, and fails the job if it still posted nothing.
+# comment per PR with each review step's result (findings, no issues, no output
+# or failed), retries a code review that produced no output once, and fails the
+# job if it still produced none or a review step failed.
 name: Claude review
 
 on:
@@ -232,20 +236,13 @@ jobs:
           FILE: ${{ steps.resolve.outputs.execution_file }}
         run: mkdir -p "$RUNNER_TEMP/claude-transcripts" && cp "$FILE" "$RUNNER_TEMP/claude-transcripts/resolve-threads.json"
 
-      # The code-review plugin asks for its own sub-agent models (Haiku, Sonnet and an
-      # Opus bug agent), and a per-call model outranks CLAUDE_CODE_SUBAGENT_MODEL. On
-      # the LOW tier, force every sub-agent onto the LOW model so the tier controls
-      # the actual reviewers. Needs Claude Code 2.1.257 or later. The HIGH tier keeps
-      # the plugin's own mix.
-      - name: Pin LOW-tier sub-agents to the LOW model
-        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.tier == 'low'
+      # The built-in /code-review and /security-review diff against origin/HEAD,
+      # which actions/checkout does not set.
+      - name: Point origin/HEAD at the base branch
+        if: steps.plan.outputs.skip == 'false'
         env:
-          LOW_MODEL: ${{ steps.plan.outputs.model }}
-        run: |
-          {
-            echo "CLAUDE_CODE_SUBAGENT_MODEL=${LOW_MODEL}"
-            echo "CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1"
-          } >> "$GITHUB_ENV"
+          BASE_REF: ${{ steps.plan.outputs.base_ref }}
+        run: git symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/${BASE_REF}"
 
       # Comments Claude posts from here on are this run's review. Thread replies
       # from the step above are older, so they do not count as review output.
@@ -258,11 +255,14 @@ jobs:
           PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
         run: node "$RUNNER_TEMP/claude-review-scripts/review-status-main.mjs" mark
 
-      # The code-review plugin's command. The extra system prompt makes it review
-      # every push (the plugin otherwise stops when Claude already commented),
-      # ignore other bots' reviews, always post a result, sets the depth, and
-      # lists threads not to raise again. A failure is reported by the status
-      # step below, which then fails the job.
+      # The built-in /code-review skill: `/code-review <level> --comment <PR#>`,
+      # followed by the CI instructions and the threads not to raise again. They
+      # go in the prompt text, not in an appended system prompt: the skill reviews
+      # in a forked agent that reads the text after the PR number but not the
+      # appended system prompt. With --comment it posts each finding as an inline
+      # comment and posts nothing when it finds nothing, so the prompt asks for a
+      # last "Review result:" line, which the check step reads from the
+      # transcript. Read-only tools only: nothing that edits files.
       - name: Claude code review
         id: review
         if: steps.plan.outputs.skip == 'false'
@@ -273,14 +273,11 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           path_to_claude_code_executable: ${{ steps.tools.outputs.claude }}
           path_to_bun_executable: ${{ steps.tools.outputs.bun }}
-          plugin_marketplaces: https://github.com/anthropics/claude-code.git
-          plugins: code-review@claude-code-plugins
-          prompt: ${{ steps.plan.outputs.review_command }}
+          prompt: ${{ steps.plan.outputs.review_prompt }}
           claude_args: |
             --model ${{ steps.plan.outputs.model }}
             --permission-mode auto
-            --append-system-prompt-file ${{ steps.plan.outputs.review_prompt_file }}
-            --allowedTools "Task,mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*),Read,Grep,Glob"
+            --allowedTools "Task,Agent,mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git branch:*),Bash(git blame:*),Bash(git merge-base:*),Bash(git rev-parse:*),Read,Grep,Glob"
 
       - name: Keep the code-review transcript
         if: always() && steps.review.outputs.execution_file != ''
@@ -288,8 +285,10 @@ jobs:
           FILE: ${{ steps.review.outputs.execution_file }}
         run: mkdir -p "$RUNNER_TEMP/claude-transcripts" && cp "$FILE" "$RUNNER_TEMP/claude-transcripts/code-review.json"
 
-      # Did the review post anything? The action skips itself, with an empty
-      # conclusion and no app token, when the PR changes the calling workflow.
+      # Did the review post anything, or does its reply end with "Review result:
+      # no issues found"? Also logs the level and recipe the skill reported. The
+      # action skips itself, with an empty conclusion and no app token, when the
+      # PR changes the calling workflow.
       - name: Check the review posted a result
         id: check
         if: steps.plan.outputs.skip == 'false'
@@ -301,10 +300,12 @@ jobs:
           STEP_OUTCOME: ${{ steps.review.outcome }}
           STEP_CONCLUSION: ${{ steps.review.outputs.conclusion }}
           STEP_HAS_APP_TOKEN: ${{ steps.review.outputs.github_token != '' }}
+          TRANSCRIPT: ${{ steps.review.outputs.execution_file }}
         run: node "$RUNNER_TEMP/claude-review-scripts/review-status-main.mjs" check
 
-      # One retry when the review posted nothing, with an explicit instruction to
-      # post a summary. Same command, tier and tools as the first attempt.
+      # One retry when the review produced no output (nothing posted and no
+      # "no issues" result line), with a note that the first attempt did not
+      # finish. Same command, level, model and tools as the first attempt.
       - name: Claude code review (retry)
         id: retry
         if: steps.plan.outputs.skip == 'false' && steps.check.outputs.result == 'empty'
@@ -315,14 +316,11 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           path_to_claude_code_executable: ${{ steps.tools.outputs.claude }}
           path_to_bun_executable: ${{ steps.tools.outputs.bun }}
-          plugin_marketplaces: https://github.com/anthropics/claude-code.git
-          plugins: code-review@claude-code-plugins
-          prompt: ${{ steps.plan.outputs.review_command }}
+          prompt: ${{ steps.plan.outputs.retry_prompt }}
           claude_args: |
             --model ${{ steps.plan.outputs.model }}
             --permission-mode auto
-            --append-system-prompt-file ${{ steps.plan.outputs.retry_prompt_file }}
-            --allowedTools "Task,mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr comment:*),Bash(gh pr list:*),Bash(gh issue view:*),Bash(gh issue list:*),Bash(gh search:*),Read,Grep,Glob"
+            --allowedTools "Task,Agent,mcp__github_inline_comment__create_inline_comment,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(git branch:*),Bash(git blame:*),Bash(git merge-base:*),Bash(git rev-parse:*),Read,Grep,Glob"
 
       - name: Keep the retry transcript
         if: always() && steps.retry.outputs.execution_file != ''
@@ -331,6 +329,7 @@ jobs:
         run: mkdir -p "$RUNNER_TEMP/claude-transcripts" && cp "$FILE" "$RUNNER_TEMP/claude-transcripts/code-review-retry.json"
 
       # Counts anything posted since the first attempt started.
+      # The transcript is the retry's own.
       - name: Check the retry posted a result
         id: check-retry
         if: steps.retry.outcome == 'success' || steps.retry.outcome == 'failure'
@@ -342,19 +341,18 @@ jobs:
           STEP_OUTCOME: ${{ steps.retry.outcome }}
           STEP_CONCLUSION: ${{ steps.retry.outputs.conclusion }}
           STEP_HAS_APP_TOKEN: ${{ steps.retry.outputs.github_token != '' }}
+          TRANSCRIPT: ${{ steps.retry.outputs.execution_file }}
         run: node "$RUNNER_TEMP/claude-review-scripts/review-status-main.mjs" check
 
-      # The built-in /security-review diffs against origin/HEAD, which
-      # actions/checkout does not set.
-      - name: Point origin/HEAD at the base branch
-        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.security == 'true' && steps.check.outputs.result != 'workflow-skip'
-        env:
-          BASE_REF: ${{ steps.plan.outputs.base_ref }}
-        run: git symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/${BASE_REF}"
-
+      # The security and migration reviews post findings with a fixed prefix
+      # ("Security (<severity>):", "Migration:"), which the status step uses to
+      # count each step's findings. They post nothing when they find nothing. A
+      # failure does not stop the next step; the status step reports it and
+      # fails the job.
       - name: Claude security review
         id: security
         if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.security == 'true' && steps.check.outputs.result != 'workflow-skip'
+        continue-on-error: true
         timeout-minutes: 20
         uses: anthropics/claude-code-action@v1
         with:
@@ -377,6 +375,7 @@ jobs:
       - name: Claude migration review
         id: migration
         if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.migration_review == 'true' && steps.check.outputs.result != 'workflow-skip'
+        continue-on-error: true
         timeout-minutes: 20
         uses: anthropics/claude-code-action@v1
         with:
@@ -406,9 +405,10 @@ jobs:
           FILE: ${{ steps.migration.outputs.execution_file }}
         run: mkdir -p "$RUNNER_TEMP/claude-transcripts" && cp "$FILE" "$RUNNER_TEMP/claude-transcripts/migration-review.json"
 
-      # Writes the PR's status comment: reviewed (findings or "No issues found"),
-      # skipped and why, or failed. Fails the job when the review failed or
-      # posted nothing, also after the retry. Runs even when a review step failed.
+      # Writes the PR's status comment: each step's result (code review, security
+      # review, migration review: findings, no issues, no output or failed), or
+      # skipped and why. Fails the job, naming the step, when a review step failed
+      # or the code review produced no output, also after the retry.
       - name: Report review status on the PR
         if: ${{ !cancelled() && steps.plan.outputs.skip == 'false' }}
         env:
@@ -419,7 +419,8 @@ jobs:
           RETRIED: ${{ steps.retry.outcome == 'success' || steps.retry.outcome == 'failure' }}
           HEAD_SHA: ${{ steps.plan.outputs.head_sha }}
           TIER: ${{ steps.plan.outputs.tier }}
-          DEPTH: ${{ steps.plan.outputs.depth }}
+          LEVEL: ${{ steps.plan.outputs.level }}
+          REVIEW_COMMAND: ${{ steps.plan.outputs.review_command }}
           DIFFICULTY: ${{ steps.plan.outputs.difficulty }}
           MODEL: ${{ steps.plan.outputs.model }}
           OPEN_THREADS_FILE: ${{ steps.plan.outputs.open_threads_file }}
