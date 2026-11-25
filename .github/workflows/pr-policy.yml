@@ -1,0 +1,74 @@
+# Org-wide PR policy. See README.md for the rules, outputs and per-repo config.
+#
+# Runs directly on this repo's PRs, as a reusable workflow
+# (uses: Mdivani-Agency/.github/.github/workflows/pr-policy.yml@main),
+# or as a ruleset-required workflow. In the last two cases it runs in the
+# target repo's context, so it checks out this repo to get the script.
+# PR code is never checked out: all PR data comes from the GitHub API.
+name: PR policy
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  workflow_call:
+    inputs:
+      policy-ref:
+        description: Ref of Mdivani-Agency/.github to load the policy script from.
+        type: string
+        required: false
+        default: main
+    outputs:
+      type:
+        description: PR type from the title (feature, fix, hotfix, docs, ci, release), empty if invalid.
+        value: ${{ jobs.pr-policy.outputs.type }}
+      difficulty:
+        description: Effective difficulty (declared, raised to high on sensitive paths), empty if unknown.
+        value: ${{ jobs.pr-policy.outputs.difficulty }}
+      sensitive:
+        description: "'true' if the PR touches a sensitive path, else 'false'."
+        value: ${{ jobs.pr-policy.outputs.sensitive }}
+      is_release:
+        description: "'true' for a development -> main release PR, else 'false'."
+        value: ${{ jobs.pr-policy.outputs.is_release }}
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  pr-policy:
+    name: PR policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: pr-policy-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    outputs:
+      type: ${{ steps.policy.outputs.type }}
+      difficulty: ${{ steps.policy.outputs.difficulty }}
+      sensitive: ${{ steps.policy.outputs.sensitive }}
+      is_release: ${{ steps.policy.outputs.is_release }}
+    steps:
+      # In this repo, test the policy as changed by the PR; everywhere else,
+      # load it from main (or the caller's policy-ref) so a PR cannot change
+      # the rules it is checked against.
+      - name: Check out policy script
+        uses: actions/checkout@v4
+        with:
+          repository: Mdivani-Agency/.github
+          ref: ${{ github.repository == 'Mdivani-Agency/.github' && github.sha || inputs.policy-ref || 'main' }}
+          path: .pr-policy
+          persist-credentials: false
+          sparse-checkout: pr-policy
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check PR
+        id: policy
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .pr-policy/pr-policy/main.mjs
