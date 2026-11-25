@@ -378,6 +378,13 @@ describe('review system prompt', () => {
     assert.doesNotMatch(text, /Review depth: high/);
   });
 
+  it('requires the review agents at every depth, even on small PRs', () => {
+    // MDI-784: on a two-file PR the model skipped the plugin's agents and reviewed in one pass.
+    for (const difficulty of ['low', 'medium', 'high', 'critical']) {
+      assert.match(reviewSystemPrompt(plan({ difficulty })), /launch its separate agents with the Task tool/);
+    }
+  });
+
   it('adds the high-depth instruction for high and critical', () => {
     assert.match(reviewSystemPrompt(plan({ difficulty: 'high' })), /Review depth: high \(effective difficulty high\)/);
     assert.match(reviewSystemPrompt(plan({ difficulty: 'critical' })), /Review depth: high/);
