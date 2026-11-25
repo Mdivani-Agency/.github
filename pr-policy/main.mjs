@@ -102,6 +102,11 @@ async function main() {
   for (const e of result.errors) annotation('error', e);
   if (result.errors.length) {
     console.log(`PR policy failed with ${result.errors.length} problem(s); all are listed above.`);
+    // Editing the PR does not re-run a ruleset-required check on its own.
+    annotation(
+      'notice',
+      'Fixed the title or description? Re-run this job (Re-run jobs on the check). Editing the PR does not re-run PR policy by itself; pushing a commit does.',
+    );
     return 1;
   }
   console.log('PR policy passed.');

@@ -41,6 +41,7 @@ Notes:
 - The GitHub API lists at most 250 commits and 3000 files of a PR. A PR with more than 250 commits fails (merge commits cannot be ruled out). A PR with more than 3000 files is treated as touching sensitive paths, and as a `docs` PR it fails.
 - The check runs on every PR, including PRs into feature branches. It is made a required check only for PRs into `main` and `development` (via an org ruleset).
 - PR data (title, description, commits, files) is read from the GitHub API, fresh on every run, so re-running the job after editing the PR sees the edit. PR code is never checked out.
+- **After editing the title or description, re-run the check.** Where `PR policy` is required by the org ruleset, editing the PR does not start a new run (tested on 2026-11-25, even though the workflow lists `edited`). Open the failed `PR policy` check and choose "Re-run jobs", or push a commit. A failing run ends with a notice that says this.
 
 ### Release PRs
 
