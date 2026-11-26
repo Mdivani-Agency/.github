@@ -6,9 +6,10 @@
 // may not exist yet, because PR policy runs at the same time), builds the
 // review plan, reads Claude's review threads, and writes step outputs (among
 // them the code-review prompts for the first attempt and the retry), the IDs
-// of Claude's open threads for the status step, and the job summary. When the
-// PR changes the calling workflow, it writes the skip to the PR's status
-// comment.
+// of Claude's open threads for the status step, and the job summary. The PR's
+// review history (how many reviews finished) comes from the status comment.
+// When the PR changes the calling workflow, or the review limit is reached and
+// there are no threads to follow up, it writes that to the status comment.
 //
 // Never fails on misconfiguration: a missing secret or variable is a warning
 // and the plan says skip.
@@ -28,11 +29,12 @@ import {
   CLAUDE_BOT_LOGIN,
   classifyThreads,
   formatReviewSummary,
+  reviewLabel,
   reviewPlan,
   reviewPrompt,
   workflowPathFromRef,
 } from './review-plan.mjs';
-import { findStatusComment, statusCommentBody } from './review-status.mjs';
+import { findStatusComment, readReviewHistory, statusCommentBody } from './review-status.mjs';
 
 const env = process.env;
 const REPO = env.GITHUB_REPOSITORY;
@@ -92,14 +94,17 @@ async function main() {
 
   let pull = null;
   let files = [];
+  let history = { reviews: 0, difficulty: '' };
   let policy = { outputs: { type: '', difficulty: '', sensitive: 'false', is_release: 'false' }, declaredDifficulty: '' };
   if (number) {
     // Fetch fresh: the event payload can be stale on re-runs.
     pull = await (await gh(`/repos/${REPO}/pulls/${number}`)).json();
-    [files, policy] = await Promise.all([
+    let comments;
+    [files, policy, comments] = await Promise.all([
       paginate(`/repos/${REPO}/pulls/${number}/files`, FILES_API_CAP),
       readConfig(pull.base.ref),
-    ]).then(([f, configText]) => [
+      paginate(`/repos/${REPO}/issues/${number}/comments`, 1000),
+    ]).then(([f, configText, c]) => [
       f,
       evaluate({
         pr: {
@@ -115,7 +120,9 @@ async function main() {
         files: f,
         configText,
       }),
+      c,
     ]);
+    history = readReviewHistory(findStatusComment(comments)?.body);
   }
 
   const plan = reviewPlan({
@@ -134,6 +141,9 @@ async function main() {
     files,
     config,
     workflowPath: workflowPathFromRef(env.GITHUB_WORKFLOW_REF, REPO),
+    label: event.label?.name ?? '',
+    labels: (pull?.labels ?? []).map((l) => l.name),
+    history,
   });
 
   let threads = null;
@@ -145,8 +155,10 @@ async function main() {
     // The "do not raise again" list goes into the prompt text after the PR
     // number: the skill's review agent reads it there, not in an appended
     // system prompt.
-    prompt = reviewPrompt(plan, threads);
-    retryPrompt = reviewPrompt(plan, threads, { retry: true });
+    if (plan.review) {
+      prompt = reviewPrompt(plan, threads);
+      retryPrompt = reviewPrompt(plan, threads, { retry: true });
+    }
     const dir = join(env.RUNNER_TEMP || '/tmp', 'claude-review');
     mkdirSync(dir, { recursive: true });
     // The status step counts which of these Claude resolved during the run.
@@ -154,10 +166,24 @@ async function main() {
     writeFileSync(openThreadsFile, JSON.stringify(threads.open.map((t) => t.id)));
   }
 
-  // A skip the PR should see (the PR changes the review workflow) goes to the status comment.
+  const resolveThreads = Boolean(plan.resolveThreads && threads?.open.length);
+  // Limit reached and no Claude thread to follow up: nothing to run.
+  if (!plan.skip && !plan.review && !resolveThreads) {
+    plan.skip = true;
+    plan.skipReason = plan.statusComment;
+  }
+
+  // A skip the PR should see (the PR changes the review workflow, or the
+  // review limit is reached) goes to the status comment.
   if (plan.skip && plan.statusComment && pull) {
     const runUrl = `${env.GITHUB_SERVER_URL}/${REPO}/actions/runs/${env.GITHUB_RUN_ID}/attempts/${env.GITHUB_RUN_ATTEMPT}`;
-    const body = statusCommentBody({ state: 'skipped', sha: pull.head.sha, reason: plan.statusComment, runUrl });
+    const body = statusCommentBody({
+      state: plan.limitReached ? 'limit' : 'skipped',
+      sha: pull.head.sha,
+      reason: plan.statusComment,
+      runUrl,
+      history,
+    });
     try {
       await upsertComment(number, body, findStatusComment);
     } catch (err) {
@@ -165,9 +191,14 @@ async function main() {
     }
   }
 
-  const resolveThreads = Boolean(plan.resolveThreads && threads?.open.length);
   setOutputs({
     skip: String(plan.skip),
+    code_review: String(!plan.skip && plan.review),
+    review_label: plan.skip || !plan.review ? '' : reviewLabel(plan),
+    limit_status: plan.limitReached ? plan.statusComment : '',
+    again_label: String(plan.againLabel),
+    prior_reviews: String(history.reviews),
+    prior_difficulty: history.difficulty,
     tier: plan.tier,
     model: plan.model,
     level: plan.level,
@@ -190,7 +221,7 @@ async function main() {
   const summary = formatReviewSummary(plan, number ? `${REPO}#${number}` : '', threads);
   if (env.GITHUB_STEP_SUMMARY) appendFileSync(env.GITHUB_STEP_SUMMARY, summary);
   console.log(summary);
-  if (!plan.skip) console.log(`Code review command: ${plan.reviewCommand}\n\nFull prompt:\n${prompt}`);
+  if (!plan.skip && plan.review) console.log(`Code review command: ${plan.reviewCommand}\n\nFull prompt:\n${prompt}`);
   if (plan.warning) annotation('warning', plan.warning);
   else if (plan.skip) annotation('notice', `Claude review skipped: ${plan.skipReason}`);
   return 0;

@@ -137,7 +137,7 @@ jobs:
 
 The `Claude review` job reviews every PR with [`anthropics/claude-code-action@v1`](https://github.com/anthropics/claude-code-action) and posts its findings as inline comments. How deep it goes depends on the PR's effective difficulty. It is **advisory**: it is not a required check, a missing secret or variable makes it warn and pass, and its findings never block a merge.
 
-It runs on `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review`) and as a reusable workflow (`workflow_call`). It runs on every PR, including sub-PRs into feature branches, and **on every push**: a PR that Claude already commented on is reviewed again at the new head. Draft PRs do not start the job (`if: github.event.pull_request.draft != true`); they are reviewed when marked ready.
+It runs on `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review`, and `labeled` for the `claude-review:again` label only) and as a reusable workflow (`workflow_call`). It runs on every PR, including sub-PRs into feature branches, and on pushes: a PR gets **the first review and 2 follow-ups** (below), each at the new head. Draft PRs are never reviewed: they do not start the job (`if: github.event.pull_request.draft != true`), also when a label is added, and they are reviewed when marked ready.
 
 Advisory does not mean silent. Every run that should review ends in one of three states, shown on the PR in the status comment (below): reviewed (each step's findings, or "no issues"), skipped with a reason, or failed (naming the step). A failed review also fails the job.
 
@@ -145,12 +145,14 @@ Advisory does not mean silent. Every run that should review ends in one of three
 
 The plan step recomputes the effective difficulty with the PR policy module (same rules, same per-repo config, PR read fresh from the API). It does not read the `difficulty:*` label, because PR policy runs at the same time and the label may not exist yet. With no valid `Difficulty:` line, the plan uses the path floor (`high`) if a sensitive path is touched, otherwise `medium`, and says so in the job summary.
 
-| Effective difficulty | Model tier | Code review | Extra |
-| --- | --- | --- | --- |
-| `low`, and every `docs` PR | LOW | `/code-review medium --comment <PR#>` | none |
-| `medium` | HIGH | `/code-review medium --comment <PR#>` | none |
-| `high` | HIGH | `/code-review high --comment <PR#>` | `/security-review` if a sensitive path is touched |
-| `critical` | HIGH | `/code-review high --comment <PR#>` | `/security-review` always; a migration review if `supabase/migrations/**` is touched |
+| Effective difficulty | Model tier | First review | Follow-ups | Extra (first review and follow-ups) |
+| --- | --- | --- | --- | --- |
+| `low`, and every `docs` PR | LOW | `/code-review low --comment <PR#>` | `low` | none |
+| `medium` | HIGH | `/code-review low --comment <PR#>` | `low` | none |
+| `high` | HIGH | `/code-review medium --comment <PR#>` | `low` | `/security-review` if a sensitive path is touched |
+| `critical` | HIGH | `/code-review high --comment <PR#>` | `low` | `/security-review` always; a migration review if `supabase/migrations/**` is touched |
+
+The LOW tier is a Sonnet model and the HIGH tier an Opus model (the two variables below). A **follow-up** is any review after an earlier review of the same PR finished; it runs `/code-review low` on the same tier. The levels are in `REVIEW_LEVEL_BY_DIFFICULTY` in [`review-plan.mjs`](pr-policy/review-plan.mjs).
 
 - **Code review** is Claude Code's built-in `/code-review` skill (the same one used locally), run as `/code-review <level> --comment <PR#>`. The level sets the review recipe and the model's effort; the skill picks the recipe for the model it runs on (on Opus 5, `medium` and `high` use the same recipe and differ in effort). It reads the PR with `gh pr diff` and the surrounding code, and `--comment` posts each finding as an inline comment. The workflow never passes `ultra` (the cloud review) or `--fix`, and the plan script refuses any level outside `low`, `medium`, `high`, `xhigh` and `max`. The code-review step can read the PR and the checkout and post inline comments; it has no tool that edits files.
 - The CI instructions and the threads not to raise again (below) follow the PR number in the prompt text. The skill reviews in a forked agent, which reads that text but not an appended system prompt (checked on Claude Code 2.1.332).
@@ -158,9 +160,22 @@ The plan step recomputes the effective difficulty with the PR policy module (sam
 - **Migration review** is a fixed prompt that checks the changed Supabase migrations for data loss, locking, RLS, `SECURITY DEFINER` functions, ordering and deploy compatibility. Comments start with `Migration:`.
 - All steps of one run use the same tier's model.
 
+### Review limit
+
+A PR gets at most **3 code reviews: the first review and 2 follow-ups**. A review counts once the code review finished (findings or "no issues"); a failed, cancelled or skipped run does not count. After the third, a push runs only the thread follow-up (below), and the status comment says "Not reviewed on `<sha>`: review limit reached". With no open Claude thread, the job ends right after the plan step.
+
+One more review runs when:
+
+- the PR has the **`claude-review:again`** label. Adding it starts a review right away (in a repo whose caller workflow lists `labeled`, see below); otherwise the next push or a re-run of the job picks it up. Once that review finishes, the workflow removes the label. If the review fails, the label stays, so the next run tries again.
+- the effective difficulty is **higher than every finished review's** (for example the PR is raised from `medium` to `critical`). That allows one review at the new difficulty.
+
+Adding any other label does not start the job, so it cannot cancel a running review.
+
+The count and the highest reviewed difficulty are kept in a hidden line of the status comment (`<!-- mdivani-claude-review-history reviews=N difficulty=D -->`). A status comment from before this line counts as one review if it reports a finished review. Deleting the status comment resets the count.
+
 ### Re-review and thread resolution
 
-Each push gets a fresh review of the current head: the prompt says that earlier Claude comments refer to earlier commits and that other bots' reviews are no reason to skip an issue. It also lists the open Claude threads, so the same issue is not posted twice.
+Each push gets a fresh review of the current head (until the limit): the prompt says that earlier Claude comments refer to earlier commits and that other bots' reviews are no reason to skip an issue. It also lists the open Claude threads, so the same issue is not posted twice.
 
 On a push (`synchronize`), a step before the review follows up on Claude's own threads:
 
@@ -174,7 +189,7 @@ If this step fails, the review still runs.
 
 The workflow keeps **one status comment per PR**. It is written with the workflow's `GITHUB_TOKEN` (author `github-actions[bot]`, not Claude), found by the hidden marker `<!-- mdivani-claude-review-status -->` and edited on every run. It shows:
 
-- the reviewed commit (short SHA), tier and level, model, and the threads the follow-up step resolved;
+- the reviewed commit (short SHA), which review it was (`first review`, `follow-up N of 2`, `extra follow-up N`), tier and level, model, and the threads the follow-up step resolved;
 - one line per review step that ran, with its result: the code review (with its command) as `N findings`, `no issues`, `no output` or `failed`; the security and migration reviews as `N findings`, `no issues` or `failed`. Findings are counted per step from the comment prefix (`Security (`, `Migration:`; anything else is the code review's);
 - whether the code review was retried;
 - "No issues found on `<sha>`" when no step posted a finding.
@@ -198,9 +213,11 @@ The job passes without reviewing, and says why in the job summary, for:
 - PRs from forks (secrets are not available there);
 - runs triggered by a bot (claude-code-action does not run for bot actors);
 - missing configuration (below): a `::warning::` names exactly what to set;
+- a `labeled` event for any label other than `claude-review:again` (the job does not start);
+- the review limit (above) when there is no open Claude thread to follow up: written to the status comment;
 - PRs that change the calling workflow (the file in `GITHUB_WORKFLOW_REF`; in a target repo, its own `claude-review.yml`). `claude-code-action` refuses to run while that file differs from the default branch. The plan step detects it from the changed files and the workflow also catches the action's own workflow-validation skip. Both write "review skipped: this PR changes the review workflow" to the status comment and pass with a notice. The review works again once the change is merged.
 
-Only the last skip is written to the status comment; drafts never start the job.
+Only the review limit and the workflow change are written to the status comment; drafts never start the job.
 
 ### Configuration
 
@@ -234,7 +251,7 @@ Reusable workflow:
 name: Claude review
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 permissions:
   contents: read
   pull-requests: write
@@ -248,7 +265,8 @@ jobs:
     #   policy-ref: main       # optional: ref of this repo to load the plan script from
 ```
 
-- The caller must grant the four permissions above.
+- The caller must grant the four permissions above. `pull-requests: write` also lets the workflow remove the `claude-review:again` label.
+- `labeled` makes adding `claude-review:again` start a review at once. Without it the label still works, from the next push or a re-run.
 - The workflow checks out this repo (`ref: main`, or `policy-ref`) to get the plan script, then checks out the PR head so Claude can read it. Nothing from the PR is executed. In this repo itself it uses the PR's own version of the script.
 
 ## Development
