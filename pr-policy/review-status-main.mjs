@@ -17,6 +17,10 @@
 //     At the end of the job: creates or edits the PR's status comment (each
 //     step's result: findings, no issues, no output or failed) and fails the
 //     step when a review step failed or the code review produced no output.
+//     A code review that finished (findings or no issues) adds one to the
+//     review history in the status comment and removes the claude-review:again
+//     label if the plan saw it. When the review limit was reached (only the
+//     thread follow-up ran), it writes that and the threads resolved.
 //
 // Environment (all): GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_API_URL,
 // GITHUB_GRAPHQL_URL, GITHUB_OUTPUT, GITHUB_STEP_SUMMARY, PR_NUMBER, SINCE,
@@ -25,11 +29,12 @@
 // TRANSCRIPT (the step's execution_file; optional).
 // report: RESULT, RETRIED, HEAD_SHA, TIER, LEVEL, DIFFICULTY, MODEL,
 // REVIEW_COMMAND, OPEN_THREADS_FILE, SECURITY_OUTCOME, MIGRATION_OUTCOME,
-// GITHUB_SERVER_URL, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT.
+// CODE_REVIEW, REVIEW_LABEL, LIMIT_STATUS, AGAIN_LABEL, PRIOR_REVIEWS,
+// PRIOR_DIFFICULTY, GITHUB_SERVER_URL, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT.
 
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { annotation, createClient, setOutputs } from './github.mjs';
-import { CLAUDE_BOT_LOGIN, WORKFLOW_CHANGED_STATUS } from './review-plan.mjs';
+import { AGAIN_LABEL, CLAUDE_BOT_LOGIN, WORKFLOW_CHANGED_STATUS, maxDifficulty } from './review-plan.mjs';
 import {
   RESULTS,
   claudeOutputSince,
@@ -150,7 +155,30 @@ async function check() {
   return 0;
 }
 
+/** Claude threads open before the run (OPEN_THREADS_FILE) that Claude resolved during it. */
+async function countResolved() {
+  try {
+    const file = env.OPEN_THREADS_FILE;
+    const openIds = file && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : [];
+    return openIds.length ? countResolvedByClaude(openIds, await fetchThreads(), BOT) : 0;
+  } catch (err) {
+    annotation('warning', `Could not count the resolved threads: ${err.message}`);
+    return 0;
+  }
+}
+
+async function removeAgainLabel() {
+  try {
+    await gh(`/repos/${REPO}/issues/${NUMBER}/labels/${encodeURIComponent(AGAIN_LABEL)}`, { method: 'DELETE', allow: [404] });
+    console.log(`Removed the ${AGAIN_LABEL} label.`);
+  } catch (err) {
+    annotation('warning', `Could not remove the ${AGAIN_LABEL} label: ${err.message}`);
+  }
+}
+
 async function report() {
+  const prior = { reviews: Number(env.PRIOR_REVIEWS) || 0, difficulty: env.PRIOR_DIFFICULTY ?? '' };
+  if (env.CODE_REVIEW !== 'true') return reportLimit(prior);
   const result = env.RESULT || RESULTS.failed;
   const retried = env.RETRIED === 'true';
   const sha = env.HEAD_SHA ?? '';
@@ -160,15 +188,12 @@ async function report() {
   const command = (env.REVIEW_COMMAND ?? '').replace(/ \d+$/, '');
 
   let output = { findings: 0, byStep: { code: 0, security: 0, migration: 0 } };
-  let resolved = 0;
   try {
     output = await claudeOutput();
-    const file = env.OPEN_THREADS_FILE;
-    const openIds = file && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : [];
-    if (openIds.length) resolved = countResolvedByClaude(openIds, await fetchThreads(), BOT);
   } catch (err) {
-    annotation('warning', `Could not count Claude's findings and resolved threads: ${err.message}`);
+    annotation('warning', `Could not count Claude's findings: ${err.message}`);
   }
+  const resolved = await countResolved();
 
   let state = 'reviewed';
   const failures = [];
@@ -198,6 +223,11 @@ async function report() {
     { name: 'Security review', text: extraReviewText(env.SECURITY_OUTCOME, output.byStep.security) },
     { name: 'Migration review', text: extraReviewText(env.MIGRATION_OUTCOME, output.byStep.migration) },
   ];
+  // A code review that finished counts towards the limit, whatever the extra steps did.
+  const counted = result === RESULTS.posted || result === RESULTS.noIssues;
+  const history = counted
+    ? { reviews: prior.reviews + 1, difficulty: maxDifficulty(prior.difficulty, env.DIFFICULTY) }
+    : prior;
   const body = statusCommentBody({
     state,
     sha,
@@ -208,15 +238,32 @@ async function report() {
     resolved,
     retried,
     runUrl,
+    history,
+    review: env.REVIEW_LABEL ?? '',
   });
   await upsertComment(NUMBER, body, findStatusComment);
-  summary(body.replace(/^<!--.*-->\n/, ''));
+  summary(stripMarkers(body));
+  if (counted && env.AGAIN_LABEL === 'true') await removeAgainLabel();
 
   if (state === 'failed') {
     annotation('error', `Claude review failed on ${short}: ${reason}`);
     return 1;
   }
   if (state === 'skipped') annotation('notice', `Claude review skipped on ${short}: ${reason}`);
+  return 0;
+}
+
+const stripMarkers = (body) => body.replace(/^(<!--.*-->\n)+/, '');
+
+/** Limit reached: only the thread follow-up ran. The history stays as it was. */
+async function reportLimit(history) {
+  const resolved = await countResolved();
+  const runUrl = `${env.GITHUB_SERVER_URL}/${REPO}/actions/runs/${env.GITHUB_RUN_ID}/attempts/${env.GITHUB_RUN_ATTEMPT}`;
+  const sha = env.HEAD_SHA ?? '';
+  const body = statusCommentBody({ state: 'limit', sha, reason: env.LIMIT_STATUS ?? '', resolved, runUrl, history });
+  await upsertComment(NUMBER, body, findStatusComment);
+  summary(stripMarkers(body));
+  annotation('notice', `Claude review not run on ${sha.slice(0, 7)}: ${env.LIMIT_STATUS ?? 'review limit reached'}`);
   return 0;
 }
 

@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { evaluate } from './policy.mjs';
 import {
+  AGAIN_LABEL,
+  MAX_REVIEWS,
   classifyThreads,
+  maxDifficulty,
+  reviewLabel,
   formatReviewSummary,
   normalizeLogin,
   oneLine,
@@ -42,6 +46,9 @@ function plan({
   actor = 'dev',
   config = CONFIGURED,
   workflowPath = '.github/workflows/claude-review.yml',
+  label = '',
+  labels = [],
+  history = undefined,
 } = {}) {
   const fileItems = files.map((filename) => ({ filename }));
   const policy = evaluate({
@@ -66,42 +73,47 @@ function plan({
     files: fileItems,
     config,
     workflowPath,
+    label,
+    labels,
+    history,
   });
 }
 
 describe('review plan: tiers', () => {
-  it('low -> LOW tier, medium level, no extras', () => {
+  it('low -> LOW tier, low level, no extras', () => {
     const p = plan({ difficulty: 'low' });
     assert.equal(p.skip, false);
+    assert.equal(p.review, true);
+    assert.equal(p.followUp, false);
     assert.equal(p.tier, 'low');
     assert.equal(p.model, 'model-low');
-    assert.equal(p.level, 'medium');
+    assert.equal(p.level, 'low');
     assert.equal(p.security, false);
     assert.equal(p.migrationReview, false);
-    assert.equal(p.reviewCommand, '/code-review medium --comment 7');
+    assert.equal(p.reviewCommand, '/code-review low --comment 7');
   });
 
-  it('medium -> HIGH tier, medium level, no extras', () => {
+  it('medium -> HIGH tier, low level, no extras', () => {
     const p = plan({ difficulty: 'medium' });
     assert.equal(p.tier, 'high');
     assert.equal(p.model, 'model-high');
-    assert.equal(p.level, 'medium');
+    assert.equal(p.level, 'low');
     assert.equal(p.security, false);
     assert.equal(p.migrationReview, false);
-    assert.equal(p.reviewCommand, '/code-review medium --comment 7');
+    assert.equal(p.reviewCommand, '/code-review low --comment 7');
   });
 
-  it('high without a sensitive path -> HIGH tier, high level, no security review', () => {
+  it('high without a sensitive path -> HIGH tier, medium level, no security review', () => {
     const p = plan({ difficulty: 'high' });
     assert.equal(p.tier, 'high');
-    assert.equal(p.level, 'high');
+    assert.equal(p.level, 'medium');
     assert.equal(p.security, false);
     assert.equal(p.migrationReview, false);
   });
 
   it('high with a sensitive path -> security review', () => {
     const p = plan({ difficulty: 'high', files: ['src/auth/login.ts'] });
-    assert.equal(p.level, 'high');
+    assert.equal(p.level, 'medium');
     assert.equal(p.security, true);
     assert.match(p.securityReason, /sensitive/);
     assert.equal(p.migrationReview, false);
@@ -110,7 +122,7 @@ describe('review plan: tiers', () => {
   it('medium on a sensitive path is raised to high and gets the security review', () => {
     const p = plan({ difficulty: 'medium', files: ['src/billing/charge.ts'] });
     assert.equal(p.difficulty, 'high');
-    assert.equal(p.level, 'high');
+    assert.equal(p.level, 'medium');
     assert.equal(p.security, true);
     assert.ok(p.notes.some((n) => /raised to high/.test(n)));
   });
@@ -168,7 +180,7 @@ describe('review plan: docs', () => {
       const p = plan({ title: 'docs: update readme', headRef: 'docs/readme', difficulty, files: ['README.md'] });
       assert.equal(p.tier, 'low', difficulty);
       assert.equal(p.model, 'model-low');
-      assert.equal(p.level, 'medium');
+      assert.equal(p.level, 'low');
       assert.equal(p.security, false);
       assert.equal(p.migrationReview, false);
     }
@@ -185,7 +197,7 @@ describe('review plan: missing or invalid difficulty', () => {
     const p = plan({ difficulty: null });
     assert.equal(p.difficulty, 'medium');
     assert.equal(p.tier, 'high');
-    assert.equal(p.level, 'medium');
+    assert.equal(p.level, 'low');
     assert.ok(p.notes.some((n) => /using medium/.test(n)));
   });
 
@@ -198,7 +210,7 @@ describe('review plan: missing or invalid difficulty', () => {
   it('missing difficulty on a sensitive path -> path floor (high)', () => {
     const p = plan({ difficulty: null, files: ['.github/workflows/ci.yml'] });
     assert.equal(p.difficulty, 'high');
-    assert.equal(p.level, 'high');
+    assert.equal(p.level, 'medium');
     assert.equal(p.security, true);
     assert.ok(p.notes.some((n) => /sensitive-path floor \(high\)/.test(n)));
   });
@@ -298,6 +310,95 @@ describe('review plan: skips', () => {
     assert.equal(plan({ action: 'opened' }).resolveThreads, false);
     assert.equal(plan({ action: 'reopened' }).resolveThreads, false);
     assert.equal(plan({ action: 'ready_for_review' }).resolveThreads, false);
+  });
+});
+
+describe('review plan: follow-ups and the review limit', () => {
+  const after = (reviews, difficulty = 'medium') => ({ reviews, difficulty });
+
+  it('follow-ups run at the low level on the same tier', () => {
+    for (const [difficulty, tier] of [['low', 'low'], ['medium', 'high'], ['high', 'high'], ['critical', 'high']]) {
+      const p = plan({ difficulty, action: 'synchronize', history: after(1, difficulty) });
+      assert.equal(p.review, true, difficulty);
+      assert.equal(p.followUp, true);
+      assert.equal(p.tier, tier);
+      assert.equal(p.level, 'low');
+      assert.equal(p.reviewCommand, '/code-review low --comment 7');
+      assert.equal(p.reviewNumber, 2);
+      assert.equal(reviewLabel(p), 'follow-up 1 of 2');
+    }
+  });
+
+  it('follow-ups keep the security and migration reviews', () => {
+    const p = plan({ difficulty: 'critical', action: 'synchronize', files: ['supabase/migrations/1.sql'], history: after(2, 'critical') });
+    assert.equal(p.level, 'low');
+    assert.equal(p.security, true);
+    assert.equal(p.migrationReview, true);
+    assert.equal(reviewLabel(p), 'follow-up 2 of 2');
+  });
+
+  it('no history is a first review', () => {
+    const p = plan({ difficulty: 'high', action: 'synchronize' });
+    assert.equal(p.followUp, false);
+    assert.equal(p.level, 'medium');
+    assert.equal(reviewLabel(p), 'first review');
+  });
+
+  it('after the first review and 2 follow-ups, no review runs; threads still resolve on a push', () => {
+    const p = plan({ difficulty: 'critical', action: 'synchronize', files: ['supabase/migrations/1.sql'], history: after(MAX_REVIEWS, 'critical') });
+    assert.equal(p.skip, false);
+    assert.equal(p.review, false);
+    assert.equal(p.limitReached, true);
+    assert.equal(p.resolveThreads, true);
+    assert.equal(p.reviewCommand, '');
+    assert.equal(p.security, false);
+    assert.equal(p.migrationReview, false);
+    assert.equal(p.model, 'model-high');
+    assert.match(p.statusComment, /review limit reached: 3 reviews.*`claude-review:again`/);
+    assert.match(formatReviewSummary(p), /no review, review limit reached/);
+    assert.equal(reviewLabel(p), 'none (limit reached after 3 reviews)');
+  });
+
+  it('the claude-review:again label allows one more review', () => {
+    const p = plan({ difficulty: 'medium', action: 'synchronize', labels: ['bug', AGAIN_LABEL], history: after(3) });
+    assert.equal(p.review, true);
+    assert.equal(p.againLabel, true);
+    assert.equal(p.level, 'low');
+    assert.equal(p.reviewNumber, 4);
+    assert.equal(reviewLabel(p), 'extra follow-up 3');
+    assert.ok(p.notes.some((n) => /label allows one more/.test(n)));
+  });
+
+  it('a difficulty above every earlier review allows one more review', () => {
+    const raised = plan({ difficulty: 'critical', action: 'synchronize', history: after(3, 'high') });
+    assert.equal(raised.review, true);
+    assert.equal(raised.level, 'low');
+    assert.ok(raised.notes.some((n) => /difficulty raised to critical/.test(n)));
+    assert.equal(plan({ difficulty: 'high', action: 'synchronize', history: after(3, 'high') }).review, false);
+    assert.equal(plan({ difficulty: 'medium', action: 'synchronize', history: after(4, 'critical') }).review, false);
+  });
+
+  it('adding the claude-review:again label starts a review; other labels are skipped', () => {
+    const again = plan({ action: 'labeled', label: AGAIN_LABEL, labels: [AGAIN_LABEL], history: after(3) });
+    assert.equal(again.skip, false);
+    assert.equal(again.review, true);
+    assert.equal(again.resolveThreads, false);
+    const other = plan({ action: 'labeled', label: 'difficulty:high', labels: ['difficulty:high'] });
+    assert.equal(other.skip, true);
+    assert.match(other.skipReason, /not claude-review:again/);
+  });
+
+  it('drafts are never reviewed, also when the label is added', () => {
+    const p = plan({ draft: true, action: 'labeled', label: AGAIN_LABEL, labels: [AGAIN_LABEL], history: after(3) });
+    assert.equal(p.skip, true);
+    assert.match(p.skipReason, /draft/);
+  });
+
+  it('maxDifficulty keeps the higher valid difficulty', () => {
+    assert.equal(maxDifficulty('', 'medium'), 'medium');
+    assert.equal(maxDifficulty('critical', 'high'), 'critical');
+    assert.equal(maxDifficulty('low', 'huge'), 'low');
+    assert.equal(maxDifficulty('', ''), '');
   });
 });
 
@@ -433,11 +534,11 @@ describe('review command', () => {
   it('uses the built-in skill with the level and the PR number, never the plugin, ultra or --fix', () => {
     for (const difficulty of ['low', 'medium', 'high', 'critical']) {
       const p = plan({ difficulty });
-      assert.match(p.reviewCommand, /^\/code-review (medium|high) --comment 7$/, difficulty);
+      assert.match(p.reviewCommand, /^\/code-review (low|medium|high) --comment 7$/, difficulty);
       assert.doesNotMatch(p.reviewCommand, /code-review:code-review|ultra|--fix/);
     }
     const docs = plan({ title: 'docs: update readme', headRef: 'docs/readme', difficulty: 'critical', files: ['README.md'] });
-    assert.equal(docs.reviewCommand, '/code-review medium --comment 7');
+    assert.equal(docs.reviewCommand, '/code-review low --comment 7');
   });
 
   it('rejects ultra and unknown levels, and bad PR numbers', () => {
@@ -453,7 +554,7 @@ describe('review command', () => {
 describe('review prompt', () => {
   it('starts with the command, then forces a fresh review on every push', () => {
     const text = reviewPrompt(plan({ difficulty: 'medium' }));
-    assert.match(text, /^\/code-review medium --comment 7\n\nCI review instructions/);
+    assert.match(text, /^\/code-review low --comment 7\n\nCI review instructions/);
     assert.match(text, /Review the current head in full even if Claude reviewed or commented on this PR before/);
     assert.doesNotMatch(text, /earlier attempt/);
   });
@@ -475,7 +576,7 @@ describe('review prompt', () => {
       open: [{ path: 'src/a.ts', line: 3, summary: 'null deref' }],
       resolvedByPeople: [{ path: 'src/b.ts', line: null, summary: 'naming' }],
     });
-    assert.match(text, /^\/code-review high --comment 7\n/);
+    assert.match(text, /^\/code-review medium --comment 7\n/);
     assert.match(text, /already raised[\s\S]*- src\/a\.ts:3: null deref/);
     assert.match(text, /Do not raise these points again[\s\S]*- src\/b\.ts: naming/);
   });

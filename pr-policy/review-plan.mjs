@@ -24,7 +24,23 @@ export const DEFAULT_DIFFICULTY = 'medium';
 export const CLAUDE_BOT_LOGIN = 'claude[bot]';
 
 /** Events the review runs on. Anything else (e.g. `closed`) is skipped. */
-export const REVIEW_ACTIONS = Object.freeze(['opened', 'synchronize', 'reopened', 'ready_for_review']);
+export const REVIEW_ACTIONS = Object.freeze(['opened', 'synchronize', 'reopened', 'ready_for_review', 'labeled']);
+
+/** Label that allows one more review after the limit. The report step removes it once a review finishes. */
+export const AGAIN_LABEL = 'claude-review:again';
+
+/** Code reviews per PR: the first review and 2 follow-ups. */
+export const MAX_REVIEWS = 3;
+
+/**
+ * `/code-review` level by effective difficulty: for the first review, and for
+ * follow-ups (a review after an earlier one of the same PR finished). Docs PRs
+ * use the `low` row.
+ */
+export const REVIEW_LEVEL_BY_DIFFICULTY = Object.freeze({
+  first: Object.freeze({ low: 'low', medium: 'low', high: 'medium', critical: 'high' }),
+  followUp: Object.freeze({ low: 'low', medium: 'low', high: 'low', critical: 'low' }),
+});
 
 const MAX_SUMMARY = 160;
 
@@ -69,6 +85,11 @@ function skipped(skipReason, extra = {}) {
     securityReason: '',
     migrationReview: false,
     resolveThreads: false,
+    review: false,
+    followUp: false,
+    reviewNumber: 0,
+    limitReached: false,
+    againLabel: false,
     reviewCommand: '',
     statusComment: '',
     notes: [],
@@ -101,15 +122,35 @@ export function reviewCommand(level, prNumber) {
  * @param {object} input.config      { hasToken: boolean, modelLow: string, modelHigh: string }
  * @param {string} [input.workflowPath] path of the workflow file that started the run (the caller's
  *                                      file for a reusable workflow), from `workflowPathFromRef()`
+ * @param {string} [input.label]     name of the label added, for the `labeled` action
+ * @param {string[]} [input.labels]  names of the PR's labels
+ * @param {object} [input.history]   from the status comment (`readReviewHistory()`): { reviews, difficulty },
+ *                                   the code reviews that finished and the highest difficulty among them
  * @returns {object} the plan; `skip` with `skipReason` (and `statusComment` when the skip is
- *                   reported on the PR), or tier/level/extras and the review command
+ *                   reported on the PR), or tier/level/extras and the review command. With
+ *                   `review: false` (`limitReached`) no review runs, only thread resolution.
  */
-export function reviewPlan({ eventName, action, actor = '', pr, policy, files = [], config, workflowPath = '' }) {
+export function reviewPlan({
+  eventName,
+  action,
+  actor = '',
+  pr,
+  policy,
+  files = [],
+  config,
+  workflowPath = '',
+  label = '',
+  labels = [],
+  history = { reviews: 0, difficulty: '' },
+}) {
   if (eventName !== 'pull_request' || !pr) {
     return skipped(`not a pull_request event (got "${eventName}"); the review only runs on pull requests.`);
   }
   if (action && !REVIEW_ACTIONS.includes(action)) {
     return skipped(`the "${action}" event is not reviewed (only ${REVIEW_ACTIONS.join(', ')}).`);
+  }
+  if (action === 'labeled' && label !== AGAIN_LABEL) {
+    return skipped(`the added label "${label}" is not ${AGAIN_LABEL}.`);
   }
   if (pr.state && pr.state !== 'open') return skipped(`the PR is ${pr.state}.`);
   if (pr.draft) return skipped('the PR is a draft. It is reviewed when it is marked ready for review.');
@@ -162,25 +203,45 @@ export function reviewPlan({ eventName, action, actor = '', pr, policy, files = 
   const isDocs = policy.outputs.type === 'docs';
   const migrations = paths.some(isMigration);
 
-  // Level of the built-in /code-review skill: medium for low, docs and medium PRs,
-  // high for high and critical. Never ultra.
-  let tier = 'high';
-  let level = 'medium';
+  // Review limit: the first review and MAX_REVIEWS - 1 follow-ups. The label
+  // or a difficulty above every finished review's allows one more.
+  const reviews = Math.max(0, Number(history?.reviews) || 0);
+  const followUp = reviews > 0;
+  const againLabel = labels.includes(AGAIN_LABEL);
+  let review = true;
+  let limitReached = false;
+  if (reviews >= MAX_REVIEWS) {
+    if (againLabel) {
+      notes.push(`Review limit reached (${reviews} reviews); the ${AGAIN_LABEL} label allows one more.`);
+    } else if (difficultyRank(difficulty) > difficultyRank(history?.difficulty)) {
+      notes.push(
+        `Review limit reached (${reviews} reviews); difficulty raised to ${difficulty} (earlier reviews: ${history?.difficulty || 'unknown'}), so one more review runs.`,
+      );
+    } else {
+      review = false;
+      limitReached = true;
+    }
+  }
+
+  // Model tier: LOW for low and docs PRs, HIGH otherwise. The /code-review level
+  // comes from REVIEW_LEVEL_BY_DIFFICULTY (lower on follow-ups). Never ultra.
+  const tier = isDocs || difficulty === 'low' ? 'low' : 'high';
+  if (isDocs && difficulty !== 'low') notes.push(`docs PR: reviewed at the low tier whatever its difficulty (${difficulty}).`);
+  const levels = followUp ? REVIEW_LEVEL_BY_DIFFICULTY.followUp : REVIEW_LEVEL_BY_DIFFICULTY.first;
+  const level = review ? levels[tier === 'low' ? 'low' : difficulty] : '';
+
   let security = false;
   let securityReason = '';
   let migrationReview = false;
-  if (isDocs || difficulty === 'low') {
-    tier = 'low';
-    if (isDocs && difficulty !== 'low') notes.push(`docs PR: reviewed at the low tier whatever its difficulty (${difficulty}).`);
-  } else if (difficulty === 'high') {
-    level = 'high';
-    security = sensitive;
-    securityReason = sensitive ? 'high difficulty and a sensitive path is touched' : '';
-  } else if (difficulty === 'critical') {
-    level = 'high';
-    security = true;
-    securityReason = 'critical difficulty';
-    migrationReview = migrations;
+  if (review && tier === 'high') {
+    if (difficulty === 'high') {
+      security = sensitive;
+      securityReason = sensitive ? 'high difficulty and a sensitive path is touched' : '';
+    } else if (difficulty === 'critical') {
+      security = true;
+      securityReason = 'critical difficulty';
+      migrationReview = migrations;
+    }
   }
 
   return {
@@ -195,10 +256,30 @@ export function reviewPlan({ eventName, action, actor = '', pr, policy, files = 
     securityReason,
     migrationReview,
     resolveThreads: action === 'synchronize',
-    reviewCommand: reviewCommand(level, pr.number),
-    statusComment: '',
+    review,
+    followUp,
+    reviewNumber: review ? reviews + 1 : reviews,
+    limitReached,
+    againLabel,
+    reviewCommand: review ? reviewCommand(level, pr.number) : '',
+    statusComment: limitReached ? limitStatus(reviews) : '',
     notes,
   };
+}
+
+function difficultyRank(difficulty) {
+  return DIFFICULTIES.indexOf(difficulty);
+}
+
+/** The higher of two difficulties ('' when neither is valid). */
+export function maxDifficulty(a, b) {
+  const best = difficultyRank(a) >= difficultyRank(b) ? a : b;
+  return difficultyRank(best) >= 0 ? best : '';
+}
+
+/** Status-comment text when the review limit is reached. */
+export function limitStatus(reviews) {
+  return `review limit reached: ${reviews} reviews (the first review and ${reviews - 1} follow-ups). Add the \`${AGAIN_LABEL}\` label for one more review: it runs when the label is added, on the next push, or when this job is re-run. Raising the difficulty also allows one more.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +419,18 @@ export function reviewReplyResult(text) {
   return findings === 0 ? { noIssues: true } : { findings };
 }
 
+/**
+ * Which review this run is: "first review", "follow-up N of 2", "extra
+ * follow-up N" (past the limit, after the label or a raised difficulty), or
+ * "none" when the limit is reached.
+ */
+export function reviewLabel(plan) {
+  if (!plan.review) return `none (limit reached after ${plan.reviewNumber} reviews)`;
+  if (!plan.followUp) return 'first review';
+  const n = plan.reviewNumber - 1;
+  return n <= MAX_REVIEWS - 1 ? `follow-up ${n} of ${MAX_REVIEWS - 1}` : `extra follow-up ${n}`;
+}
+
 /** Job summary for the review plan. */
 export function formatReviewSummary(plan, prRef = '', threads = null) {
   if (plan.skip) {
@@ -346,7 +439,10 @@ export function formatReviewSummary(plan, prRef = '', threads = null) {
     return lines.join('\n');
   }
   const yesNo = (v, why) => (v ? `yes${why ? ` (${why})` : ''}` : 'no');
-  const lines = [`## Claude review: ${plan.tier} tier, ${plan.level} level${prRef ? ` (${prRef})` : ''}`, ''];
+  const heading = plan.review
+    ? `${plan.tier} tier, ${plan.level} level, ${reviewLabel(plan)}`
+    : `no review, ${plan.statusComment}`;
+  const lines = [`## Claude review: ${heading}${prRef ? ` (${prRef})` : ''}`, ''];
   if (plan.notes.length) {
     plan.notes.forEach((n) => lines.push(`- ${n}`));
     lines.push('');
@@ -356,7 +452,8 @@ export function formatReviewSummary(plan, prRef = '', threads = null) {
     '| --- | --- |',
     `| Effective difficulty | \`${plan.difficulty}\` |`,
     `| Model tier | ${plan.tier === 'low' ? 'LOW (`CLAUDE_REVIEW_MODEL_LOW`)' : 'HIGH (`CLAUDE_REVIEW_MODEL_HIGH`)'} |`,
-    `| Code review | \`${plan.reviewCommand}\` (built-in skill, ${plan.level} level) |`,
+    `| Review | ${reviewLabel(plan)} |`,
+    `| Code review | ${plan.review ? `\`${plan.reviewCommand}\` (built-in skill, ${plan.level} level)` : 'not run'} |`,
     `| Security review | ${yesNo(plan.security, plan.securityReason)} |`,
     `| Migration review | ${yesNo(plan.migrationReview, 'critical and supabase/migrations touched')} |`,
   );

@@ -5,10 +5,18 @@
 // the review posted anything, and to write the one status comment per PR.
 // Run the tests with `node --test 'pr-policy/*.test.mjs'`.
 
+import { DIFFICULTIES } from './policy.mjs';
 import { CLAUDE_BOT_LOGIN, normalizeLogin, reviewReplyResult } from './review-plan.mjs';
 
 /** Hidden marker that identifies the status comment. */
 export const STATUS_MARKER = '<!-- mdivani-claude-review-status -->';
+
+/**
+ * Hidden line in the status comment with the PR's review history: the code
+ * reviews that finished and the highest difficulty among them, e.g.
+ * `<!-- mdivani-claude-review-history reviews=2 difficulty=high -->`.
+ */
+const HISTORY_RE = /<!-- mdivani-claude-review-history reviews=(\d+) difficulty=([a-z]*) -->/;
 
 /** The status comment is written with the workflow's GITHUB_TOKEN, so it is posted as this login. */
 export const STATUS_AUTHOR = 'github-actions[bot]';
@@ -140,6 +148,24 @@ export function reviewResult({ outcome, conclusion = '', hasAppToken = true, pos
   return RESULTS.empty;
 }
 
+/**
+ * Review history from the status comment body: { reviews, difficulty }. A
+ * status comment from before the history line counts as one review when it
+ * reports a finished review. No comment: no reviews.
+ */
+export function readReviewHistory(body) {
+  const text = String(body ?? '');
+  const m = text.match(HISTORY_RE);
+  if (m) return { reviews: Number(m[1]), difficulty: DIFFICULTIES.includes(m[2]) ? m[2] : '' };
+  const finished = /\*\*(Reviewed|No issues found on) `/.test(text);
+  return { reviews: finished ? 1 : 0, difficulty: '' };
+}
+
+export function historyLine({ reviews = 0, difficulty = '' } = {}) {
+  const n = Math.max(0, Math.trunc(Number(reviews) || 0));
+  return `<!-- mdivani-claude-review-history reviews=${n} difficulty=${DIFFICULTIES.includes(difficulty) ? difficulty : ''} -->`;
+}
+
 /** The status comment among a PR's issue comments: the workflow's own comment with the marker. */
 export function findStatusComment(comments, author = STATUS_AUTHOR) {
   return (comments ?? []).find((c) => c?.user?.login === author && String(c.body ?? '').includes(STATUS_MARKER)) ?? null;
@@ -183,7 +209,8 @@ export function extraReviewText(outcome, findings = 0) {
  * Body of the status comment.
  *
  * @param {object} s
- * @param {'reviewed'|'skipped'|'failed'} s.state
+ * @param {'reviewed'|'skipped'|'failed'|'limit'} s.state  `limit`: not reviewed because the review limit is
+ *                                  reached; `reason` says so, and the threads resolved are shown
  * @param {string} s.sha            reviewed (head) commit
  * @param {string} [s.reason]       why it was skipped or failed; names the step that failed
  * @param {object} [s.plan]         { tier, level, difficulty, model, command }
@@ -192,6 +219,8 @@ export function extraReviewText(outcome, findings = 0) {
  * @param {number} [s.resolved]     threads resolved by the follow-up step
  * @param {boolean} [s.retried]     the code review was run a second time because the first posted nothing
  * @param {string} [s.runUrl]
+ * @param {object} [s.history]      { reviews, difficulty } after this run, kept in a hidden line
+ * @param {string} [s.review]       "first review" or "follow-up N of 2"
  */
 export function statusCommentBody({
   state,
@@ -203,10 +232,15 @@ export function statusCommentBody({
   resolved = 0,
   retried = false,
   runUrl = '',
+  history = { reviews: 0, difficulty: '' },
+  review = '',
 }) {
   const at = `\`${shortSha(sha)}\``;
-  const lines = [STATUS_MARKER, '### Claude review', ''];
-  if (state === 'skipped') {
+  const lines = [STATUS_MARKER, historyLine(history), '### Claude review', ''];
+  if (state === 'limit') {
+    lines.push(`**Not reviewed on ${at}**: ${reason}`);
+    if (resolved > 0) lines.push('', `Threads resolved by the follow-up: ${resolved}.`);
+  } else if (state === 'skipped') {
     lines.push(`**Skipped on ${at}**: ${reason}`);
   } else if (state === 'failed') {
     lines.push(`**Failed on ${at}**: ${reason}`);
@@ -215,12 +249,13 @@ export function statusCommentBody({
   } else {
     lines.push(`**Reviewed ${at}**: ${plural(findings, 'new finding')}, posted as inline comments.`);
   }
-  if (state !== 'skipped' && plan.tier) {
+  if ((state === 'reviewed' || state === 'failed') && plan.tier) {
     lines.push(
       '',
       '| Item | Value |',
       '| --- | --- |',
       `| Commit | ${at} |`,
+      ...(review ? [`| Review | ${review} |`] : []),
       `| Tier and level | ${plan.tier.toUpperCase()} tier, ${plan.level} level (difficulty ${plan.difficulty}) |`,
       `| Model | \`${plan.model}\` |`,
     );

@@ -9,6 +9,8 @@ import {
   extraReviewText,
   findStatusComment,
   findingStep,
+  historyLine,
+  readReviewHistory,
   reviewResult,
   statusCommentBody,
   transcriptSummary,
@@ -246,6 +248,55 @@ describe('status comment', () => {
     const skipped = statusCommentBody({ state: 'skipped', sha, reason: 'review skipped: this PR changes the review workflow' });
     assert.match(skipped, /Skipped on `0123456`\*\*: review skipped: this PR changes the review workflow/);
     assert.doesNotMatch(skipped, /\| Model/);
+  });
+
+  it('keeps the review history in a hidden line and shows which review ran', () => {
+    const steps = [{ name: CODE, text: codeReviewText(RESULTS.posted, 1) }];
+    const body = statusCommentBody({
+      state: 'reviewed',
+      sha,
+      plan,
+      steps,
+      findings: 1,
+      history: { reviews: 2, difficulty: 'critical' },
+      review: 'follow-up 1 of 2',
+    });
+    assert.ok(body.startsWith(`${STATUS_MARKER}\n<!-- mdivani-claude-review-history reviews=2 difficulty=critical -->\n`));
+    assert.match(body, /\| Review \| follow-up 1 of 2 \|/);
+    assert.deepEqual(readReviewHistory(body), { reviews: 2, difficulty: 'critical' });
+  });
+
+  it('a skip keeps the history it was given', () => {
+    const body = statusCommentBody({ state: 'skipped', sha, reason: 'x', history: { reviews: 3, difficulty: 'high' } });
+    assert.deepEqual(readReviewHistory(body), { reviews: 3, difficulty: 'high' });
+  });
+
+  it('states the review limit with the resolved threads and no table', () => {
+    const body = statusCommentBody({
+      state: 'limit',
+      sha,
+      plan,
+      reason: 'review limit reached: 3 reviews',
+      resolved: 2,
+      history: { reviews: 3, difficulty: 'medium' },
+    });
+    assert.match(body, /Not reviewed on `0123456`\*\*: review limit reached: 3 reviews/);
+    assert.match(body, /Threads resolved by the follow-up: 2\./);
+    assert.doesNotMatch(body, /\| Model/);
+    assert.deepEqual(readReviewHistory(body), { reviews: 3, difficulty: 'medium' });
+  });
+
+  it('reads the history of comments without the hidden line, and of no comment', () => {
+    assert.deepEqual(readReviewHistory(undefined), { reviews: 0, difficulty: '' });
+    assert.deepEqual(readReviewHistory(`${STATUS_MARKER}\n**Reviewed \`abc1234\`**: 2 new findings`), { reviews: 1, difficulty: '' });
+    assert.deepEqual(readReviewHistory(`${STATUS_MARKER}\n**No issues found on \`abc1234\`.**`), { reviews: 1, difficulty: '' });
+    assert.deepEqual(readReviewHistory(`${STATUS_MARKER}\n**Failed on \`abc1234\`**: x`), { reviews: 0, difficulty: '' });
+    assert.deepEqual(readReviewHistory(`${STATUS_MARKER}\n**Skipped on \`abc1234\`**: x`), { reviews: 0, difficulty: '' });
+  });
+
+  it('writes only digits and known difficulties into the hidden line', () => {
+    assert.equal(historyLine({ reviews: '2 --> <b>', difficulty: 'evil -->' }), '<!-- mdivani-claude-review-history reviews=0 difficulty= -->');
+    assert.equal(historyLine({ reviews: 3.7, difficulty: 'low' }), '<!-- mdivani-claude-review-history reviews=3 difficulty=low -->');
   });
 
   it('step texts', () => {

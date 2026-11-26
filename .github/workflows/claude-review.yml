@@ -11,7 +11,11 @@
 # to review it; PR code is never executed by this workflow.
 #
 # The code review is Claude Code's built-in /code-review skill, run as
-# `/code-review <level> --comment <PR#>` (medium or high; never ultra, never --fix).
+# `/code-review <level> --comment <PR#>` (low, medium or high; never ultra,
+# never --fix). Follow-ups (reviews after the first one finished) run at low.
+# A PR gets the first review and 2 follow-ups; after that only the thread
+# follow-up runs, until the claude-review:again label or a higher difficulty
+# allows one more review. The count lives in the PR's status comment.
 #
 # Advisory only: a missing secret or variable is a warning and the job passes.
 # A run that should review never ends silently: the workflow keeps one status
@@ -22,7 +26,7 @@ name: Claude review
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_call:
     inputs:
       policy-ref:
@@ -44,10 +48,14 @@ permissions:
 jobs:
   claude-review:
     name: Claude review
-    # Draft PRs do not start a runner. The plan script checks again (second
-    # guard for workflow_call). Non-PR events have no draft field and reach the
-    # plan, which skips them.
-    if: github.event.pull_request.draft != true
+    # Draft PRs do not start a runner, and of the label events only adding
+    # claude-review:again does (so another label does not cancel a running
+    # review through the concurrency group). The plan script checks both again
+    # (second guard for workflow_call). Non-PR events have no draft field and
+    # reach the plan, which skips them.
+    if: >-
+      github.event.pull_request.draft != true &&
+      (github.event.action != 'labeled' || github.event.label.name == 'claude-review:again')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     concurrency:
@@ -239,7 +247,7 @@ jobs:
       # The built-in /code-review and /security-review diff against origin/HEAD,
       # which actions/checkout does not set.
       - name: Point origin/HEAD at the base branch
-        if: steps.plan.outputs.skip == 'false'
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.code_review == 'true'
         env:
           BASE_REF: ${{ steps.plan.outputs.base_ref }}
         run: git symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/${BASE_REF}"
@@ -249,7 +257,7 @@ jobs:
       # The time comes from GitHub's clock, the same clock as comment timestamps.
       - name: Mark review start
         id: mark
-        if: steps.plan.outputs.skip == 'false'
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.code_review == 'true'
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
@@ -265,7 +273,7 @@ jobs:
       # transcript. Read-only tools only: nothing that edits files.
       - name: Claude code review
         id: review
-        if: steps.plan.outputs.skip == 'false'
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.code_review == 'true'
         continue-on-error: true
         timeout-minutes: 30
         uses: anthropics/claude-code-action@v1
@@ -291,7 +299,7 @@ jobs:
       # PR changes the calling workflow.
       - name: Check the review posted a result
         id: check
-        if: steps.plan.outputs.skip == 'false'
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.code_review == 'true'
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -308,7 +316,7 @@ jobs:
       # finish. Same command, level, model and tools as the first attempt.
       - name: Claude code review (retry)
         id: retry
-        if: steps.plan.outputs.skip == 'false' && steps.check.outputs.result == 'empty'
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.code_review == 'true' && steps.check.outputs.result == 'empty'
         continue-on-error: true
         timeout-minutes: 30
         uses: anthropics/claude-code-action@v1
@@ -351,7 +359,7 @@ jobs:
       # fails the job.
       - name: Claude security review
         id: security
-        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.security == 'true' && steps.check.outputs.result != 'workflow-skip'
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.code_review == 'true' && steps.plan.outputs.security == 'true' && steps.check.outputs.result != 'workflow-skip'
         continue-on-error: true
         timeout-minutes: 20
         uses: anthropics/claude-code-action@v1
@@ -374,7 +382,7 @@ jobs:
 
       - name: Claude migration review
         id: migration
-        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.migration_review == 'true' && steps.check.outputs.result != 'workflow-skip'
+        if: steps.plan.outputs.skip == 'false' && steps.plan.outputs.code_review == 'true' && steps.plan.outputs.migration_review == 'true' && steps.check.outputs.result != 'workflow-skip'
         continue-on-error: true
         timeout-minutes: 20
         uses: anthropics/claude-code-action@v1
@@ -408,7 +416,9 @@ jobs:
       # Writes the PR's status comment: each step's result (code review, security
       # review, migration review: findings, no issues, no output or failed), or
       # skipped and why. Fails the job, naming the step, when a review step failed
-      # or the code review produced no output, also after the retry.
+      # or the code review produced no output, also after the retry. A finished
+      # code review adds one to the review count and removes claude-review:again.
+      # When the limit was reached, it says so and counts the resolved threads.
       - name: Report review status on the PR
         if: ${{ !cancelled() && steps.plan.outputs.skip == 'false' }}
         env:
@@ -426,6 +436,12 @@ jobs:
           OPEN_THREADS_FILE: ${{ steps.plan.outputs.open_threads_file }}
           SECURITY_OUTCOME: ${{ steps.security.outcome }}
           MIGRATION_OUTCOME: ${{ steps.migration.outcome }}
+          CODE_REVIEW: ${{ steps.plan.outputs.code_review }}
+          REVIEW_LABEL: ${{ steps.plan.outputs.review_label }}
+          LIMIT_STATUS: ${{ steps.plan.outputs.limit_status }}
+          AGAIN_LABEL: ${{ steps.plan.outputs.again_label }}
+          PRIOR_REVIEWS: ${{ steps.plan.outputs.prior_reviews }}
+          PRIOR_DIFFICULTY: ${{ steps.plan.outputs.prior_difficulty }}
         run: node "$RUNNER_TEMP/claude-review-scripts/review-status-main.mjs" report
 
       # Transcripts of the Claude steps, for debugging a review that posted
